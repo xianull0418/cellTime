@@ -1,0 +1,11 @@
+/data
+/models
+/results
+/logs
+/checkpoints
+/pretrained
+/datasets
+/notebooks
+/tests
+/utils
+/LICENSE
