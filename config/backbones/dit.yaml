@@ -1,0 +1,24 @@
+# DiT 骨干网络配置
+# 适配单细胞潜空间的 Diffusion Transformer
+
+# Transformer 架构参数
+dim: 512  # 模型隐藏维度
+n_layers: 6  # Transformer 层数
+n_heads: 8  # 注意力头数
+multiple_of: 256  # FFN 维度的倍数
+ffn_dim_multiplier: null  # FFN 维度倍数（可选）
+norm_eps: 1e-5  # 归一化 epsilon
+
+# 条件编码
+class_dropout_prob: 0.1  # 类别 dropout 概率（用于 Classifier-Free Guidance）
+num_classes: 10  # 类别数（如果使用条件生成）
+use_class_cond: false  # 是否使用类别条件
+
+# 时间编码
+use_time_embedding: true  # 是否使用时间嵌入
+time_emb_dim: 256  # 时间嵌入维度
+
+# 单细胞特定
+max_seq_len: 1  # 序列长度（单细胞是单个向量，设为 1）
+use_pos_embedding: false  # 是否使用位置编码（单个向量不需要）
+

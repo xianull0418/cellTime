@@ -1,0 +1,52 @@
+# Rectified Flow 配置文件
+# 在 AE 潜空间训练 Rectified Flow 模型
+
+model:
+  mode: direct  # 模式：direct (x1->x2) 或 inversion (x1->noise->x2)
+  backbone: dit  # 骨干网络：dit/mlp
+  latent_dim: 256  # 潜空间维度（必须与 AE 的 latent_dim 一致）
+  ln_noise: true  # 使用 log-normal 噪声采样
+  
+  # AE 预训练权重
+  ae_checkpoint: null  # 从命令行指定
+  freeze_ae: true  # 是否冻结 AE 参数
+  
+  # 条件信息
+  use_cond: false  # 是否使用条件信息（如细胞类型）
+  cond_dim: null  # 条件维度
+
+training:
+  batch_size: 128  # 批次大小
+  learning_rate: 1e-4  # 学习率
+  weight_decay: 1e-5  # 权重衰减
+  max_epochs: 100  # 最大训练轮数
+  
+  # 采样配置
+  sample_steps: 50  # 采样步数
+  cfg_scale: 2.0  # Classifier-Free Guidance 强度
+  sample_every_n_epochs: 1  # 采样频率
+  
+  # 学习率调度器
+  scheduler:
+    type: cosine  # 调度器类型：cosine/plateau
+    T_max: 100  # CosineAnnealing 的 T_max
+
+data:
+  data_path: null  # 数据路径，从命令行指定
+  valid_pairs_only: true  # 是否只使用有效的时序对
+  time_col: time  # 时间列名
+  next_cell_col: next_cell_id  # 下一个细胞 ID 列名
+  num_workers: 4  # 数据加载线程数
+  pin_memory: true  # 是否固定内存
+
+logging:
+  output_dir: output/rtf  # 输出目录
+  log_every_n_steps: 50  # 日志记录频率
+  save_samples: true  # 是否保存采样结果
+
+accelerator:
+  accelerator: auto  # 加速器类型
+  devices: auto  # 设备数量
+  precision: 32  # 精度
+  gradient_clip_val: 1.0  # 梯度裁剪值
+

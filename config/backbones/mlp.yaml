@@ -1,0 +1,17 @@
+# MLP 骨干网络配置
+# 基于多层感知器的速度场预测器
+
+# MLP 架构参数
+hidden_dim: [512, 512]  # 隐藏层维度列表
+dropout: 0.1  # 隐藏层 dropout
+input_dropout: 0.1  # 输入层 dropout
+
+# 时间编码
+use_time_embedding: true  # 是否使用时间嵌入
+time_emb_dim: 128  # 时间嵌入维度
+
+# 条件编码
+use_cond: false  # 是否使用条件信息
+cond_type: continuous  # 条件类型：continuous/categorical
+cond_dim: null  # 条件维度
+
