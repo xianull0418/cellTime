@@ -3,6 +3,7 @@ cellTime 数据集模块
 """
 
 from dataset.cell_dataset import (
+    load_anndata,
     StaticCellDataset,
     TemporalCellDataset,
     MultiCellDataset,
@@ -12,6 +13,7 @@ from dataset.cell_dataset import (
 )
 
 __all__ = [
+    'load_anndata',
     'StaticCellDataset',
     'TemporalCellDataset',
     'MultiCellDataset',

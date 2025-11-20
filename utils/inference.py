@@ -21,11 +21,18 @@ cellTime 推理脚本
         --time_points="[0.0,0.5,1.0,1.5,2.0]"
 """
 
+import sys
+from pathlib import Path
+
+# 添加项目根目录到 Python 路径
+PROJECT_ROOT = Path(__file__).parent.parent.absolute()
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import fire
 import torch
 import numpy as np
 import scanpy as sc
-from pathlib import Path
 from typing import Optional, List, Union
 from tqdm import tqdm
 
@@ -63,11 +70,22 @@ class CellTimeInference:
         
         # 加载 RTF 模型
         print(f"加载 RTF 模型: {rtf_checkpoint}")
-        # RTF 需要 ae_encoder，从加载的 checkpoint 中获取
-        self.rtf_system = RTFSystem.load_from_checkpoint(
-            rtf_checkpoint,
+        # 先加载 checkpoint（不传递 ae_encoder，避免 OmegaConf 序列化问题）
+        checkpoint = torch.load(rtf_checkpoint, map_location=device)
+        
+        # 从 checkpoint 中提取配置和状态
+        # 注意：需要传递 ae_encoder 给 RTFSystem 初始化
+        # 但我们需要手动处理，避免 Lightning 的自动参数合并
+        hparams = checkpoint.get('hyper_parameters', {})
+        
+        # 创建 RTFSystem 实例（传递 ae_encoder）
+        self.rtf_system = RTFSystem(
+            cfg=hparams,
             ae_encoder=self.ae_system.autoencoder.encoder
         )
+        
+        # 加载模型权重
+        self.rtf_system.load_state_dict(checkpoint['state_dict'], strict=False)
         self.rtf_system.to(device)
         self.rtf_system.eval()
         self.rtf_system.freeze()

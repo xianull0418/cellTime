@@ -9,3 +9,6 @@
 /tests
 /LICENSE
 *output
+
+
+/dataset/__pycache__
