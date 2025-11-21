@@ -94,24 +94,45 @@ def train(
     print(f"\n加载预训练 AE: {cfg.model.ae_checkpoint}")
     ae_system = AESystem.load_from_checkpoint(cfg.model.ae_checkpoint)
     ae_encoder = ae_system.autoencoder.encoder
+    ae_decoder = ae_system.autoencoder.decoder  # 🔧 添加decoder
     
-    # 冻结 AE Encoder
+    # 自动从 AE 中获取 latent_dim 并同步到 RTF 配置
+    ae_latent_dim = ae_system.autoencoder.latent_dim
+    print(f"AE 潜空间维度: {ae_latent_dim}")
+    
+    # 检查并同步 latent_dim
+    if cfg.model.latent_dim is None:
+        print(f"警告: RTF 配置中 latent_dim 为 None，自动设置为 AE 的 latent_dim={ae_latent_dim}")
+        cfg.model.latent_dim = ae_latent_dim
+    elif cfg.model.latent_dim != ae_latent_dim:
+        print(f"警告: RTF 配置中 latent_dim={cfg.model.latent_dim} 与 AE 的 latent_dim={ae_latent_dim} 不一致！")
+        print(f"自动覆盖为 AE 的 latent_dim={ae_latent_dim}")
+        cfg.model.latent_dim = ae_latent_dim
+    else:
+        print(f"✓ RTF 和 AE 的 latent_dim 一致: {cfg.model.latent_dim}")
+    
+    # 冻结 AE Encoder 和 Decoder
     if cfg.model.freeze_ae:
         ae_encoder.eval()
+        ae_decoder.eval()  # 🔧 同时冻结decoder
         for param in ae_encoder.parameters():
             param.requires_grad = False
-        print("AE Encoder 已冻结")
+        for param in ae_decoder.parameters():
+            param.requires_grad = False
+        print("AE Encoder 和 Decoder 已冻结")
     else:
-        print("Warning: AE Encoder 未冻结，将参与训练")
+        print("Warning: AE Encoder 和 Decoder 未冻结，将参与训练")
     
     # 创建 RTF 系统
-    system = RTFSystem(cfg, ae_encoder=ae_encoder)
+    system = RTFSystem(cfg, ae_encoder=ae_encoder, ae_decoder=ae_decoder)
     
     # 打印模型信息
     rtf_params = sum(p.numel() for p in system.model.parameters() if p.requires_grad)
-    ae_params = sum(p.numel() for p in ae_encoder.parameters())
+    ae_encoder_params = sum(p.numel() for p in ae_encoder.parameters())
+    ae_decoder_params = sum(p.numel() for p in ae_decoder.parameters())
     print(f"\nRTF 模型参数数量: {rtf_params:,} ({rtf_params / 1e6:.2f}M)")
-    print(f"AE Encoder 参数数量: {ae_params:,} ({ae_params / 1e6:.2f}M)")
+    print(f"AE Encoder 参数数量: {ae_encoder_params:,} ({ae_encoder_params / 1e6:.2f}M)")
+    print(f"AE Decoder 参数数量: {ae_decoder_params:,} ({ae_decoder_params / 1e6:.2f}M)")
     print(f"模式: {cfg.model.mode}")
     print(f"骨干网络: {cfg.model.backbone}")
     print(f"潜空间维度: {cfg.model.latent_dim}")

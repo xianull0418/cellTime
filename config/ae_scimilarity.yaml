@@ -1,0 +1,48 @@
+# scimilarity 微调配置文件
+# 用于在 scimilarity 预训练模型基础上微调
+# 参考架构: 1024-1024-1024 -> 128
+
+model:
+  n_genes: 3000  # 目标数据的基因数量（会自动根据数据调整）
+  latent_dim: 128  # scimilarity 使用 128
+  hidden_dim: [1024, 1024, 1024]  # scimilarity 架构
+  dropout_rate: 0.5  # scimilarity 使用 0.5
+  
+  # 预训练权重路径
+  pretrained_encoder: "/gpfs/flash/home/jcw/projects/research/cellTime/data/models/scimilarity/encoder.ckpt"
+  pretrained_decoder: "/gpfs/flash/home/jcw/projects/research/cellTime/data/models/scimilarity/decoder.ckpt"
+  
+  # 微调策略
+  freeze_encoder_layers: false # 是否冻结 Encoder 中间层
+  reset_input_output_layers: true # 是否重置输入输出层（当基因数量不匹配时必须为 true）
+
+training:
+  batch_size: 256
+  learning_rate: 1e-4  # 微调时通常使用较小的学习率
+  weight_decay: 1e-5
+  max_epochs: 50       # 微调通常不需要从头训练那么多轮
+  reconstruction_loss: mse
+  
+  scheduler:
+    mode: min
+    factor: 0.5
+    patience: 5
+
+data:
+  data_path: null
+  train_split: 0.9
+  num_workers: 4
+  pin_memory: true
+
+logging:
+  output_dir: output/ae_finetune
+  log_every_n_steps: 50
+  val_check_interval: 0.5
+  log_embeddings_every_n_epochs: 5
+
+accelerator:
+  accelerator: auto
+  devices: auto
+  precision: 32
+  gradient_clip_val: 1.0
+
