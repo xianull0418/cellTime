@@ -5,7 +5,9 @@ model:
   mode: direct  # 模式：direct (x1->x2) 或 inversion (x1->noise->x2)
   backbone: dit  # 骨干网络：dit/mlp
   latent_dim: 256  # 潜空间维度（必须与 AE 的 latent_dim 一致）
+  n_genes: null  # 基因数（将从 AE 自动同步）
   ln_noise: true  # 使用 log-normal 噪声采样
+  normalize_latent: true  # 是否在采样时归一化潜空间向量（scimilarity encoder 需要）
   
   # AE 预训练权重
   ae_checkpoint: null  # 从命令行指定

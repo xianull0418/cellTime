@@ -96,9 +96,11 @@ def train(
     ae_encoder = ae_system.autoencoder.encoder
     ae_decoder = ae_system.autoencoder.decoder  # 🔧 添加decoder
     
-    # 自动从 AE 中获取 latent_dim 并同步到 RTF 配置
+    # 自动从 AE 中获取 latent_dim 和 n_genes 并同步到 RTF 配置
     ae_latent_dim = ae_system.autoencoder.latent_dim
+    ae_n_genes = ae_system.cfg.model.n_genes
     print(f"AE 潜空间维度: {ae_latent_dim}")
+    print(f"AE 基因数: {ae_n_genes}")
     
     # 检查并同步 latent_dim
     if cfg.model.latent_dim is None:
@@ -110,6 +112,10 @@ def train(
         cfg.model.latent_dim = ae_latent_dim
     else:
         print(f"✓ RTF 和 AE 的 latent_dim 一致: {cfg.model.latent_dim}")
+    
+    # 同步 n_genes（RTF 数据集需要与 AE 使用相同的基因数）
+    cfg.model.n_genes = ae_n_genes
+    print(f"✓ RTF 数据集将使用 AE 的基因数: {ae_n_genes}")
     
     # 冻结 AE Encoder 和 Decoder
     if cfg.model.freeze_ae:

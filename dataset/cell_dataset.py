@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import Dataset
 import scanpy as sc
 from pathlib import Path
-from typing import Union, Optional
+from typing import Union, Optional, List
 
 try:
     import anndata as ad
@@ -22,6 +22,9 @@ def load_anndata(
     *,
     index_col: int = 0,
     verbose: bool = False,
+    max_genes: Optional[int] = None,
+    select_hvg: bool = True,
+    target_genes: Optional[List[str]] = None,
 ) -> sc.AnnData:
     """
     加载 AnnData 对象
@@ -36,44 +39,173 @@ def load_anndata(
         data: 数据路径或 AnnData 对象
         index_col: CSV/Excel 文件的索引列
         verbose: 是否打印信息
+        max_genes: 最大基因数。如果数据基因数超过此值，自动选择高变基因
+        select_hvg: 是否在基因数超标时选择高变基因
+        target_genes: 目标基因列表。如果提供，将数据映射到此基因列表（缺失填0）
     
     Returns:
         AnnData 对象
     """
     # 已经是 AnnData 对象
     if ad is not None and isinstance(data, ad.AnnData):
-        return data
-    
-    # 文件路径
-    path = Path(data)
-    if not path.exists():
-        raise FileNotFoundError(f"数据文件不存在: {path}")
-    
-    if verbose:
-        print(f"从文件加载数据: {path}")
-    
-    suffix = path.suffix.lower()
-    
-    if suffix == ".h5ad":
-        adata = sc.read_h5ad(path)
-    elif suffix in {".h5", ".hdf5"}:
-        adata = sc.read(path)
-    elif suffix in {".csv", ".xlsx", ".xls"}:
-        if suffix == ".csv":
-            df = pd.read_csv(path, index_col=index_col)
-        else:
-            df = pd.read_excel(path, index_col=index_col)
-        
-        adata = sc.AnnData(
-            X=df.to_numpy(),
-            obs=pd.DataFrame(index=df.index),
-            var=pd.DataFrame(index=df.columns),
-        )
+        adata = data.copy()  # 复制一份，以免修改原对象
     else:
-        raise ValueError(f"不支持的文件格式: {suffix}")
+        # 文件路径
+        path = Path(data)
+        if not path.exists():
+            raise FileNotFoundError(f"数据文件不存在: {path}")
+        
+        if verbose:
+            print(f"从文件加载数据: {path}")
+        
+        suffix = path.suffix.lower()
+        
+        if suffix == ".h5ad":
+            adata = sc.read_h5ad(path)
+        elif suffix in {".h5", ".hdf5"}:
+            adata = sc.read(path)
+        elif suffix in {".csv", ".xlsx", ".xls"}:
+            if suffix == ".csv":
+                df = pd.read_csv(path, index_col=index_col)
+            else:
+                df = pd.read_excel(path, index_col=index_col)
+            
+            adata = sc.AnnData(
+                X=df.to_numpy(),
+                obs=pd.DataFrame(index=df.index),
+                var=pd.DataFrame(index=df.columns),
+            )
+        else:
+            raise ValueError(f"不支持的文件格式: {suffix}")
+        
+        if verbose:
+            print(f"数据加载完成，维度: {adata.shape}")
+    
+    # 基因映射（优先级高于 max_genes）
+    if target_genes is not None:
+        if verbose:
+            print(f"正在将数据映射到目标基因列表 ({len(target_genes)} 个基因)...")
+        
+        # 确保 var 索引是唯一的
+        adata.var_names_make_unique()
+        
+        # 创建一个新的 AnnData，包含目标基因
+        # 使用 pandas 的 reindex 功能，这会自动处理缺失值（填 NaN）
+        # 注意：我们需要在 X 上操作，而不是 DataFrame，以节省内存
+        
+        # 找出交集基因
+        common_genes = list(set(adata.var_names) & set(target_genes))
+        if verbose:
+            print(f"  - 共有基因数: {len(common_genes)}")
+            
+        # 创建新的空的 AnnData
+        # 注意：scipy sparse matrix 不支持 reindex，所以如果 X 是稀疏的，可能需要转换
+        # 但考虑到内存，我们先尝试构建一个新的
+        
+        # 方法：先创建一个全零矩阵
+        # 然后填入共有基因的值
+        
+        # 为了简单起见，如果内存允许，我们可以使用 pandas
+        # 但 28k * 3k cells 并不大，应该没问题
+        
+        # 更高效的方法：
+        # 1. 扩展原始数据，补全缺失基因
+        # 2. 排序以匹配 target_genes
+        
+        # 使用 anndata 的 concat 功能可能比较复杂，直接操作 DataFrame
+        if hasattr(adata.X, "toarray"):
+            X_df = pd.DataFrame(adata.X.toarray(), index=adata.obs_names, columns=adata.var_names)
+        else:
+            X_df = pd.DataFrame(adata.X, index=adata.obs_names, columns=adata.var_names)
+            
+        # Reindex
+        X_new = X_df.reindex(columns=target_genes, fill_value=0.0)
+        
+        # 创建新 AnnData
+        new_adata = sc.AnnData(
+            X=X_new.values,
+            obs=adata.obs.copy(),
+            var=pd.DataFrame(index=target_genes)
+        )
+        
+        # 复制 layers
+        for layer_name, layer_data in adata.layers.items():
+            if hasattr(layer_data, "toarray"):
+                layer_df = pd.DataFrame(layer_data.toarray(), index=adata.obs_names, columns=adata.var_names)
+            else:
+                layer_df = pd.DataFrame(layer_data, index=adata.obs_names, columns=adata.var_names)
+            
+            new_layer = layer_df.reindex(columns=target_genes, fill_value=0.0)
+            new_adata.layers[layer_name] = new_layer.values
+            
+        adata = new_adata
+        if verbose:
+            print(f"基因映射完成，新维度: {adata.shape}")
+            
+    # 基因数检查和高变基因选择（仅当没有提供 target_genes 时）
+    elif max_genes is not None and adata.shape[1] > max_genes and select_hvg:
+        if verbose:
+            print(f"基因数 ({adata.shape[1]}) 超过上限 ({max_genes})，自动选择 {max_genes} 个高变基因...")
+        
+        # 选择高变基因
+        adata = _select_highly_variable_genes(adata, n_top_genes=max_genes, verbose=verbose)
+        
+        if verbose:
+            print(f"高变基因选择完成，新维度: {adata.shape}")
+    
+    return adata
+
+
+def _select_highly_variable_genes(
+    adata: sc.AnnData,
+    n_top_genes: int,
+    verbose: bool = False,
+) -> sc.AnnData:
+    """
+    选择高变基因
+    
+    Args:
+        adata: AnnData 对象
+        n_top_genes: 要选择的基因数量
+        verbose: 是否打印信息
+    
+    Returns:
+        筛选后的 AnnData 对象
+    """
+    # 保存原始数据（如果还没有保存）
+    if 'counts' not in adata.layers:
+        # 如果 X 是稀疏矩阵，需要先转换
+        if hasattr(adata.X, "toarray"):
+            adata.layers['counts'] = adata.X.toarray().copy()
+        else:
+            adata.layers['counts'] = adata.X.copy()
+    
+    # 计算高变基因
+    # 使用 Seurat 方法，这是单细胞数据中最常用的方法
+    try:
+        sc.pp.highly_variable_genes(
+            adata,
+            n_top_genes=n_top_genes,
+            flavor='seurat_v3',
+            layer='counts' if 'counts' in adata.layers else None,
+            subset=False,  # 先不筛选，只标记
+        )
+    except Exception as e:
+        if verbose:
+            print(f"Warning: Seurat v3 方法失败 ({e})，使用默认方法...")
+        # 如果失败，使用默认的 seurat 方法
+        sc.pp.highly_variable_genes(
+            adata,
+            n_top_genes=n_top_genes,
+            flavor='seurat',
+            subset=False,
+        )
+    
+    # 筛选高变基因
+    adata = adata[:, adata.var['highly_variable']].copy()
     
     if verbose:
-        print(f"数据加载完成，维度: {adata.shape}")
+        print(f"已选择 {adata.shape[1]} 个高变基因")
     
     return adata
 
@@ -89,6 +221,8 @@ class StaticCellDataset(Dataset):
         data: Union[str, Path, "ad.AnnData"],
         *,
         layer: Optional[str] = "log1p",
+        max_genes: Optional[int] = None,
+        target_genes: Optional[List[str]] = None,
         index_col: int = 0,
         verbose: bool = False,
         seed: Optional[int] = None,
@@ -96,15 +230,31 @@ class StaticCellDataset(Dataset):
         """
         Args:
             data: 数据路径或 AnnData 对象
-            layer: 使用的 layer 名称，默认为 'log1p'。如果为 None 或不存在，则使用 adata.X
+            layer: 使用的 layer 名称
+            max_genes: 最大基因数（自动选择高变基因）
+            target_genes: 目标基因列表（用于映射）
             index_col: CSV/Excel 文件的索引列
             verbose: 是否打印信息
             seed: 随机种子
         """
         if isinstance(data, (str, Path)):
-            self.adata = load_anndata(data, index_col=index_col, verbose=verbose)
+            self.adata = load_anndata(
+                data, 
+                index_col=index_col, 
+                verbose=verbose, 
+                max_genes=max_genes,
+                target_genes=target_genes
+            )
         else:
             self.adata = data
+            # 基因映射
+            if target_genes is not None:
+                self.adata = load_anndata(self.adata, verbose=verbose, target_genes=target_genes)
+            # 基因数检查
+            elif max_genes is not None and self.adata.shape[1] > max_genes:
+                if verbose:
+                    print(f"基因数 ({self.adata.shape[1]}) 超过上限 ({max_genes})，自动选择 {max_genes} 个高变基因...")
+                self.adata = _select_highly_variable_genes(self.adata, n_top_genes=max_genes, verbose=verbose)
         
         self.n_cells, self.n_genes = self.adata.shape
         
@@ -160,6 +310,8 @@ class TemporalCellDataset(Dataset):
         data: Union[str, Path, "ad.AnnData"],
         *,
         layer: Optional[str] = "log1p",
+        max_genes: Optional[int] = None,
+        target_genes: Optional[List[str]] = None,
         valid_pairs_only: bool = True,
         time_col: str = "time",
         next_cell_col: str = "next_cell_id",
@@ -169,7 +321,9 @@ class TemporalCellDataset(Dataset):
         """
         Args:
             data: 数据路径或 AnnData 对象
-            layer: 使用的 layer 名称，默认为 'log1p'。如果为 None 或不存在，则使用 adata.X
+            layer: 使用的 layer 名称
+            max_genes: 最大基因数
+            target_genes: 目标基因列表
             valid_pairs_only: 是否只使用有效的时序对
             time_col: 时间列名
             next_cell_col: 下一个细胞 ID 列名
@@ -177,9 +331,23 @@ class TemporalCellDataset(Dataset):
             verbose: 是否打印信息
         """
         if isinstance(data, (str, Path)):
-            self.adata = load_anndata(data, index_col=index_col, verbose=verbose)
+            self.adata = load_anndata(
+                data, 
+                index_col=index_col, 
+                verbose=verbose, 
+                max_genes=max_genes,
+                target_genes=target_genes
+            )
         else:
             self.adata = data
+            # 基因映射
+            if target_genes is not None:
+                self.adata = load_anndata(self.adata, verbose=verbose, target_genes=target_genes)
+            # 基因数检查
+            elif max_genes is not None and self.adata.shape[1] > max_genes:
+                if verbose:
+                    print(f"基因数 ({self.adata.shape[1]}) 超过上限 ({max_genes})，自动选择 {max_genes} 个高变基因...")
+                self.adata = _select_highly_variable_genes(self.adata, n_top_genes=max_genes, verbose=verbose)
         
         self.n_cells, self.n_genes = self.adata.shape
         self.time_col = time_col
@@ -296,6 +464,7 @@ class MultiCellDataset(Dataset):
         data: Union[str, Path, "ad.AnnData"],
         *,
         layer: Optional[str] = "log1p",
+        max_genes: Optional[int] = None,
         n_cells_per_sample: int = 5,
         sampling_with_replacement: bool = True,
         index_col: int = 0,
@@ -306,6 +475,7 @@ class MultiCellDataset(Dataset):
         Args:
             data: 数据路径或 AnnData 对象
             layer: 使用的 layer 名称，默认为 'log1p'。如果为 None 或不存在，则使用 adata.X
+            max_genes: 最大基因数。如果数据基因数超过此值，自动选择高变基因
             n_cells_per_sample: 每次采样的细胞数量
             sampling_with_replacement: 是否有放回采样
             index_col: CSV/Excel 文件的索引列
@@ -313,9 +483,14 @@ class MultiCellDataset(Dataset):
             seed: 随机种子
         """
         if isinstance(data, (str, Path)):
-            self.adata = load_anndata(data, index_col=index_col, verbose=verbose)
+            self.adata = load_anndata(data, index_col=index_col, verbose=verbose, max_genes=max_genes)
         else:
             self.adata = data
+            # 如果是 AnnData 对象，也需要检查基因数
+            if max_genes is not None and self.adata.shape[1] > max_genes:
+                if verbose:
+                    print(f"基因数 ({self.adata.shape[1]}) 超过上限 ({max_genes})，自动选择 {max_genes} 个高变基因...")
+                self.adata = _select_highly_variable_genes(self.adata, n_top_genes=max_genes, verbose=verbose)
         
         self.n_cells, self.n_genes = self.adata.shape
         self.n_cells_per_sample = n_cells_per_sample
