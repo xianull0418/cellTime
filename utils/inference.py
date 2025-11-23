@@ -2,23 +2,6 @@
 """
 cellTime 推理脚本
 使用训练好的 AE + RTF 模型进行单细胞时序预测
-
-使用示例：
-    # 基础推理
-    python utils/inference.py predict \
-        --ae_checkpoint=output/ae/checkpoints/last.ckpt \
-        --rtf_checkpoint=output/rtf_direct_dit/checkpoints/last.ckpt \
-        --input_data=data/test_cells.h5ad \
-        --output_path=results/predictions.h5ad \
-        --target_time=1.0
-    
-    # 批量时序预测
-    python utils/inference.py predict_trajectory \
-        --ae_checkpoint=output/ae/checkpoints/last.ckpt \
-        --rtf_checkpoint=output/rtf_direct_dit/checkpoints/last.ckpt \
-        --input_data=data/test_cells.h5ad \
-        --output_path=results/trajectory.h5ad \
-        --time_points="[0.0,0.5,1.0,1.5,2.0]"
 """
 
 import sys
@@ -40,6 +23,9 @@ from models.ae import AESystem
 from models.rtf import RTFSystem
 from dataset import load_anndata
 
+# 添加可视化相关导入
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 class CellTimeInference:
     """cellTime 推理引擎"""
@@ -59,17 +45,17 @@ class CellTimeInference:
             device: 设备（cuda/cpu）
         """
         self.device = device
-        print(f"使用设备: {device}")
+        print(f"Using device: {device}")
         
         # 加载 AE 模型
-        print(f"加载 AE 模型: {ae_checkpoint}")
+        print(f"Loading AE model: {ae_checkpoint}")
         self.ae_system = AESystem.load_from_checkpoint(ae_checkpoint)
         self.ae_system.to(device)
         self.ae_system.eval()
         self.ae_system.freeze()
         
         # 加载 RTF 模型
-        print(f"加载 RTF 模型: {rtf_checkpoint}")
+        print(f"Loading RTF model: {rtf_checkpoint}")
         # 先加载 checkpoint（不传递 ae_encoder，避免 OmegaConf 序列化问题）
         checkpoint = torch.load(rtf_checkpoint, map_location=device)
         
@@ -90,7 +76,7 @@ class CellTimeInference:
         self.rtf_system.eval()
         self.rtf_system.freeze()
         
-        print("模型加载完成！")
+        print("Model loaded successfully!")
     
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -192,18 +178,6 @@ class CellTimeInference:
     ) -> Union[torch.Tensor, tuple]:
         """
         端到端预测：x_start -> x_end
-        
-        Args:
-            x_start: 起始基因表达 [B, n_genes]
-            t_start: 起始时间
-            t_end: 目标时间
-            sample_steps: 采样步数
-            cfg_scale: CFG 强度
-            return_trajectory: 是否返回完整轨迹
-        
-        Returns:
-            x_end: 预测的基因表达 [B, n_genes]
-            或 (x_end, trajectory) 如果 return_trajectory=True
         """
         # 编码到潜空间
         z_start = self.encode(x_start)
@@ -241,55 +215,27 @@ def predict(
     batch_size: int = 64,
     device: str = "auto",
 ):
-    """
-    单次时序预测
-    
-    Args:
-        ae_checkpoint: AE 模型路径
-        rtf_checkpoint: RTF 模型路径
-        input_data: 输入数据路径（.h5ad）
-        output_path: 输出路径（.h5ad）
-        target_time: 目标时间点
-        start_time: 起始时间点
-        sample_steps: 采样步数
-        cfg_scale: CFG 强度
-        batch_size: 批次大小
-        device: 设备（auto/cuda/cpu）
-    
-    Example:
-        python utils/inference.py predict \
-            --ae_checkpoint=output/ae/checkpoints/last.ckpt \
-            --rtf_checkpoint=output/rtf/checkpoints/last.ckpt \
-            --input_data=data/cells.h5ad \
-            --output_path=results/predictions.h5ad \
-            --target_time=1.0
-    """
-    # 设备选择
+    """单次时序预测"""
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 初始化推理引擎
     engine = CellTimeInference(ae_checkpoint, rtf_checkpoint, device)
     
-    # 加载输入数据
-    print(f"\n加载输入数据: {input_data}")
+    print(f"\nLoading input data: {input_data}")
     adata = load_anndata(input_data, verbose=True)
     
-    # 转换为 tensor
     X = adata.X.toarray() if hasattr(adata.X, "toarray") else adata.X
     X_tensor = torch.tensor(X, dtype=torch.float32)
     
-    # 批量预测
-    print(f"\n开始预测（{start_time} -> {target_time}）...")
+    print(f"\nStart predicting ({start_time} -> {target_time})...")
     predictions = []
     
     n_batches = (len(X_tensor) + batch_size - 1) // batch_size
-    for i in tqdm(range(n_batches), desc="预测进度"):
+    for i in tqdm(range(n_batches), desc="Prediction progress"):
         batch_start = i * batch_size
         batch_end = min((i + 1) * batch_size, len(X_tensor))
         x_batch = X_tensor[batch_start:batch_end]
         
-        # 预测
         x_pred = engine.predict(
             x_batch,
             t_start=start_time,
@@ -300,17 +246,14 @@ def predict(
         
         predictions.append(x_pred.numpy())
     
-    # 合并结果
     predictions = np.concatenate(predictions, axis=0)
     
-    # 创建结果 AnnData
     adata_pred = sc.AnnData(
         X=predictions,
         obs=adata.obs.copy(),
         var=adata.var.copy(),
     )
     
-    # 添加元数据
     adata_pred.uns["prediction_info"] = {
         "start_time": start_time,
         "target_time": target_time,
@@ -320,15 +263,12 @@ def predict(
         "rtf_checkpoint": rtf_checkpoint,
     }
     
-    # 保存结果
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     adata_pred.write(output_path)
     
-    print(f"\n预测完成！")
-    print(f"结果保存在: {output_path}")
-    print(f"预测细胞数: {len(predictions)}")
-    print(f"基因数: {predictions.shape[1]}")
+    print(f"\nPrediction completed!")
+    print(f"Results saved to: {output_path}")
 
 
 def predict_trajectory(
@@ -342,54 +282,26 @@ def predict_trajectory(
     batch_size: int = 64,
     device: str = "auto",
 ):
-    """
-    多时间点轨迹预测
-    
-    Args:
-        ae_checkpoint: AE 模型路径
-        rtf_checkpoint: RTF 模型路径
-        input_data: 输入数据路径
-        output_path: 输出路径（.h5ad）
-        time_points: 时间点列表（JSON 格式字符串）
-        sample_steps: 采样步数
-        cfg_scale: CFG 强度
-        batch_size: 批次大小
-        device: 设备
-    
-    Example:
-        python utils/inference.py predict_trajectory \
-            --ae_checkpoint=output/ae/checkpoints/last.ckpt \
-            --rtf_checkpoint=output/rtf/checkpoints/last.ckpt \
-            --input_data=data/cells.h5ad \
-            --output_path=results/trajectory.h5ad \
-            --time_points="[0.0,0.5,1.0,1.5,2.0]"
-    """
+    """多时间点轨迹预测"""
     import json
-    
-    # 解析时间点
     time_points = json.loads(time_points)
-    print(f"预测时间点: {time_points}")
+    print(f"Predicting time points: {time_points}")
     
-    # 设备选择
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 初始化推理引擎
     engine = CellTimeInference(ae_checkpoint, rtf_checkpoint, device)
     
-    # 加载输入数据
-    print(f"\n加载输入数据: {input_data}")
+    print(f"\nLoading input data: {input_data}")
     adata = load_anndata(input_data, verbose=True)
     
-    # 转换为 tensor
     X = adata.X.toarray() if hasattr(adata.X, "toarray") else adata.X
     X_tensor = torch.tensor(X, dtype=torch.float32)
     
-    # 预测每个时间点
     all_predictions = {}
     
     for t in time_points:
-        print(f"\n预测时间点 t={t}...")
+        print(f"\nPredicting time point t={t}...")
         predictions = []
         
         n_batches = (len(X_tensor) + batch_size - 1) // batch_size
@@ -398,7 +310,6 @@ def predict_trajectory(
             batch_end = min((i + 1) * batch_size, len(X_tensor))
             x_batch = X_tensor[batch_start:batch_end]
             
-            # 预测
             x_pred = engine.predict(
                 x_batch,
                 t_start=time_points[0],
@@ -411,7 +322,6 @@ def predict_trajectory(
         
         all_predictions[f"t_{t}"] = np.concatenate(predictions, axis=0)
     
-    # 创建结果 AnnData（使用最后一个时间点作为主数据）
     last_time = time_points[-1]
     adata_pred = sc.AnnData(
         X=all_predictions[f"t_{last_time}"],
@@ -419,11 +329,9 @@ def predict_trajectory(
         var=adata.var.copy(),
     )
     
-    # 将其他时间点作为 layers 保存
     for t in time_points[:-1]:
         adata_pred.layers[f"t_{t}"] = all_predictions[f"t_{t}"]
     
-    # 添加元数据
     adata_pred.uns["trajectory_info"] = {
         "time_points": time_points,
         "sample_steps": sample_steps,
@@ -432,19 +340,12 @@ def predict_trajectory(
         "rtf_checkpoint": rtf_checkpoint,
     }
     
-    # 保存结果
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     adata_pred.write(output_path)
     
-    print(f"\n轨迹预测完成！")
-    print(f"结果保存在: {output_path}")
-    print(f"预测细胞数: {len(adata_pred)}")
-    print(f"时间点数: {len(time_points)}")
-    print(f"数据结构:")
-    print(f"  - X: 时间点 t={last_time} 的预测")
-    for t in time_points[:-1]:
-        print(f"  - layers['t_{t}']: 时间点 t={t} 的预测")
+    print(f"\nTrajectory prediction completed!")
+    print(f"Results saved to: {output_path}")
 
 
 def encode_data(
@@ -454,70 +355,95 @@ def encode_data(
     batch_size: int = 64,
     device: str = "auto",
 ):
-    """
-    将单细胞数据编码到潜空间
-    
-    Args:
-        ae_checkpoint: AE 模型路径
-        input_data: 输入数据路径
-        output_path: 输出路径（.h5ad）
-        batch_size: 批次大小
-        device: 设备
-    
-    Example:
-        python utils/inference.py encode_data \
-            --ae_checkpoint=output/ae/checkpoints/last.ckpt \
-            --input_data=data/cells.h5ad \
-            --output_path=results/latent.h5ad
-    """
-    # 设备选择
+    """将单细胞数据编码到潜空间"""
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 加载 AE 模型
-    print(f"加载 AE 模型: {ae_checkpoint}")
+    print(f"Loading AE model: {ae_checkpoint}")
     ae_system = AESystem.load_from_checkpoint(ae_checkpoint)
     ae_system.to(device)
     ae_system.eval()
     ae_system.freeze()
     
-    # 加载输入数据
-    print(f"\n加载输入数据: {input_data}")
+    print(f"\nLoading input data: {input_data}")
     adata = load_anndata(input_data, verbose=True)
     
-    # 转换为 tensor
     X = adata.X.toarray() if hasattr(adata.X, "toarray") else adata.X
     X_tensor = torch.tensor(X, dtype=torch.float32)
     
-    # 批量编码
-    print(f"\n编码到潜空间...")
+    print(f"\nEncoding to latent space...")
     latents = []
     
     n_batches = (len(X_tensor) + batch_size - 1) // batch_size
     with torch.no_grad():
-        for i in tqdm(range(n_batches), desc="编码进度"):
+        for i in tqdm(range(n_batches), desc="Encoding progress"):
             batch_start = i * batch_size
             batch_end = min((i + 1) * batch_size, len(X_tensor))
             x_batch = X_tensor[batch_start:batch_end].to(device)
             
-            # 编码
             z = ae_system.autoencoder.encode(x_batch)
             latents.append(z.cpu().numpy())
     
-    # 合并结果
     latents = np.concatenate(latents, axis=0)
-    
-    # 保存为 AnnData（潜空间作为 obsm）
     adata.obsm["X_latent"] = latents
     
-    # 保存结果
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     adata.write(output_path)
     
-    print(f"\n编码完成！")
-    print(f"结果保存在: {output_path}")
-    print(f"潜空间维度: {latents.shape}")
+    print(f"\nEncoding completed!")
+    print(f"Results saved to: {output_path}")
+    print(f"Latent dimension: {latents.shape}")
+
+
+def visualize(
+    data_path: str,
+    output_path: str = "visualization.png",
+    n_pca: int = 50,
+    color_by: str = "cell_type",
+    basis: str = "umap",
+):
+    """
+    可视化预测结果 (PCA/UMAP)
+    
+    Args:
+        data_path: 包含预测结果的 .h5ad 文件路径
+        output_path: 输出图像路径
+        n_pca: PCA 组件数
+        color_by: 着色依据的列名
+        basis: 可视化基础 (umap/pca)
+    """
+    print(f"Loading data from: {data_path}")
+    adata = sc.read_h5ad(data_path)
+    
+    print("Preprocessing...")
+    # 基础预处理用于可视化
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+    sc.pp.highly_variable_genes(adata, min_mean=0.0125, max_mean=3, min_disp=0.5)
+    adata = adata[:, adata.var.highly_variable]
+    sc.pp.scale(adata, max_value=10)
+    sc.tl.pca(adata, svd_solver='arpack', n_comps=n_pca)
+    
+    if basis == "umap":
+        sc.pp.neighbors(adata, n_neighbors=10, n_pcs=40)
+        sc.tl.umap(adata)
+    
+    print(f"Plotting {basis}...")
+    
+    # 设置绘图风格
+    sc.set_figure_params(dpi=150, frameon=False, figsize=(6, 6))
+    
+    # 创建画布
+    if basis == "umap":
+        sc.pl.umap(adata, color=color_by if color_by in adata.obs.columns else None, show=False)
+    else:
+        sc.pl.pca(adata, color=color_by if color_by in adata.obs.columns else None, show=False)
+        
+    # 保存图像
+    plt.title(f"Visualization of Predictions ({basis.upper()})", fontsize=12)
+    plt.savefig(output_path, bbox_inches='tight')
+    print(f"Visualization saved to: {output_path}")
 
 
 if __name__ == "__main__":
@@ -525,11 +451,5 @@ if __name__ == "__main__":
         "predict": predict,
         "predict_trajectory": predict_trajectory,
         "encode_data": encode_data,
+        "visualize": visualize,
     })
-
-
-
-
-
-
-

@@ -1,145 +1,143 @@
 #!/bin/bash
 ################################################################################
-# cellTime 推理脚本
-# 用途：使用训练好的 AE + RTF 模型进行单细胞时序预测
+# cellTime Inference Script
+# Usage: Use trained AE + RTF models for single-cell temporal prediction
 # 
-# 使用方法：
-#   bash infer.sh predict          # 单次时间点预测
-#   bash infer.sh trajectory       # 多时间点轨迹预测
-#   bash infer.sh encode           # 仅编码到潜空间
-#   bash infer.sh help             # 显示帮助信息
+# Usage:
+#   bash infer.sh predict          # Single time point prediction
+#   bash infer.sh trajectory       # Multi-time point trajectory prediction
+#   bash infer.sh encode           # Encode to latent space only
+#   bash infer.sh visualize        # Visualize results (UMAP/PCA)
+#   bash infer.sh help             # Show help
 ################################################################################
 
-set -e  # 遇到错误立即退出
+set -e  # Exit immediately on error
 
-# 获取脚本所在目录（项目根目录）
+# Get project root directory
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
-# 设置 PYTHONPATH 以确保能导入项目模块
+# Set PYTHONPATH
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
-echo "✓ 项目根目录: $SCRIPT_DIR"
+echo "✓ Project Root: $SCRIPT_DIR"
 echo "✓ PYTHONPATH: $PYTHONPATH"
 echo ""
 
 # ============================================================================
-# 配置区域 - 根据实际情况修改
+# Configuration - Update as needed
 # ============================================================================
 
-# 数据路径
-TEMPORAL_DATA_PATH="/gpfs/hybrid/data/public/TEDD/link_cells/hs_AD_Brain_Cerebellum[Organoid]_36-a.link.h5ad"
+# Data Path
+TEMPORAL_DATA_PATH="/gpfs/hybrid/data/public/PerturBase/drug_perturb.true_time/test/5.link_cells/GSE134839.Erlotinib.link.h5ad"
 
-# 模型 checkpoint 路径（
-AE_CHECKPOINT="output/ae/checkpoints/last.ckpt"
-RTF_CHECKPOINT="output/rtf_direct_dit/checkpoints/last.ckpt"
+# Model Checkpoint Paths (Updated to current best models)
+AE_CHECKPOINT="output/ae_pretrained/checkpoints/last.ckpt"
+RTF_CHECKPOINT="output/rtf_direct_unet_pretrained_1123_debug/checkpoints/last.ckpt"
 
-# 输出目录
+# Output Directory
 OUTPUT_DIR="output/inference_results"
 
-# 推理参数
+# Inference Parameters
 BATCH_SIZE=64
 SAMPLE_STEPS=50
 CFG_SCALE=2.0
 DEVICE="auto"  # auto/cuda/cpu
 
 # ============================================================================
-# 函数定义
+# Function Definitions
 # ============================================================================
 
-# 显示帮助信息
+# Show Help
 show_help() {
     echo "========================================"
-    echo "cellTime 推理脚本"
+    echo "cellTime Inference Script"
     echo "========================================"
     echo ""
-    echo "使用方法："
+    echo "Usage:"
     echo "  bash infer.sh <mode> [options]"
     echo ""
-    echo "推理模式："
-    echo "  predict      - 单次时间点预测（默认 t=0 -> t=1）"
-    echo "  trajectory   - 多时间点轨迹预测"
-    echo "  encode       - 仅编码到潜空间（不需要 RTF 模型）"
-    echo "  help         - 显示此帮助信息"
+    echo "Modes:"
+    echo "  predict      - Single time point prediction (default t=0 -> t=1)"
+    echo "  trajectory   - Multi-time point trajectory prediction"
+    echo "  encode       - Encode to latent space only"
+    echo "  visualize    - Visualize results (UMAP/PCA)"
+    echo "  help         - Show this help message"
     echo ""
-    echo "环境变量（可选）："
-    echo "  TARGET_TIME    - 目标时间点（默认 1.0）"
-    echo "  START_TIME     - 起始时间点（默认 0.0）"
-    echo "  TIME_POINTS    - 轨迹时间点列表（默认 '[0.0,0.5,1.0,1.5,2.0]'）"
-    echo "  SAMPLE_STEPS   - 采样步数（默认 50）"
-    echo "  CFG_SCALE      - CFG 强度（默认 2.0）"
-    echo "  BATCH_SIZE     - 批次大小（默认 64）"
+    echo "Environment Variables (Optional):"
+    echo "  TARGET_TIME    - Target time point (default 1.0)"
+    echo "  START_TIME     - Start time point (default 0.0)"
+    echo "  TIME_POINTS    - Trajectory time points (default '[0.0,0.5,1.0,1.5,2.0]')"
+    echo "  SAMPLE_STEPS   - Sampling steps (default 50)"
+    echo "  CFG_SCALE      - CFG Scale (default 2.0)"
+    echo "  BATCH_SIZE     - Batch size (default 64)"
+    echo "  VIZ_FILE       - File to visualize (for visualize mode)"
     echo ""
-    echo "示例："
-    echo "  # 默认参数预测"
+    echo "Examples:"
+    echo "  # Default prediction"
     echo "  bash infer.sh predict"
     echo ""
-    echo "  # 自定义目标时间"
+    echo "  # Custom target time"
     echo "  TARGET_TIME=2.0 bash infer.sh predict"
     echo ""
-    echo "  # 多时间点轨迹"
+    echo "  # Multi-point trajectory"
     echo "  bash infer.sh trajectory"
     echo ""
-    echo "  # 仅编码"
-    echo "  bash infer.sh encode"
+    echo "  # Visualize results"
+    echo "  VIZ_FILE=output/inference_results/trajectory.h5ad bash infer.sh visualize"
     echo ""
-    echo "当前配置："
-    echo "  数据路径: $TEMPORAL_DATA_PATH"
-    echo "  AE 模型: $AE_CHECKPOINT"
-    echo "  RTF 模型: $RTF_CHECKPOINT"
-    echo "  输出目录: $OUTPUT_DIR"
+    echo "Current Configuration:"
+    echo "  Data Path: $TEMPORAL_DATA_PATH"
+    echo "  AE Model: $AE_CHECKPOINT"
+    echo "  RTF Model: $RTF_CHECKPOINT"
+    echo "  Output Dir: $OUTPUT_DIR"
     echo "========================================"
 }
 
-# 检查文件是否存在
+# Check if file exists
 check_file() {
     if [ ! -f "$1" ]; then
-        echo "❌ 错误: 文件不存在 - $1"
+        echo "❌ Error: File not found - $1"
         exit 1
     fi
 }
 
-# 创建输出目录
+# Create output directory
 create_output_dir() {
     mkdir -p "$OUTPUT_DIR"
-    echo "✓ 输出目录: $OUTPUT_DIR"
+    echo "✓ Output Directory: $OUTPUT_DIR"
 }
 
-# 单次时间点预测
+# Single Time Point Prediction
 run_predict() {
     echo "========================================"
-    echo "运行单次时间点预测"
+    echo "Running Single Time Point Prediction"
     echo "========================================"
     
-    # 检查必要文件
     check_file "$TEMPORAL_DATA_PATH"
     check_file "$AE_CHECKPOINT"
     check_file "$RTF_CHECKPOINT"
     
-    # 创建输出目录
     create_output_dir
     
-    # 参数设置（支持环境变量覆盖）
     local start_time=${START_TIME:-0.0}
     local target_time=${TARGET_TIME:-1.0}
     local sample_steps=${SAMPLE_STEPS:-$SAMPLE_STEPS}
     local cfg_scale=${CFG_SCALE:-$CFG_SCALE}
     local batch_size=${BATCH_SIZE:-$BATCH_SIZE}
     
-    # 输出文件名
     local output_file="${OUTPUT_DIR}/predict_t${start_time}_to_t${target_time}.h5ad"
     
     echo ""
-    echo "配置参数："
-    echo "  起始时间: $start_time"
-    echo "  目标时间: $target_time"
-    echo "  采样步数: $sample_steps"
-    echo "  CFG 强度: $cfg_scale"
-    echo "  批次大小: $batch_size"
-    echo "  输出文件: $output_file"
+    echo "Parameters:"
+    echo "  Start Time: $start_time"
+    echo "  Target Time: $target_time"
+    echo "  Steps: $sample_steps"
+    echo "  CFG Scale: $cfg_scale"
+    echo "  Batch Size: $batch_size"
+    echo "  Output File: $output_file"
     echo ""
     
-    # 运行推理
     python utils/inference.py predict \
         --ae_checkpoint="$AE_CHECKPOINT" \
         --rtf_checkpoint="$RTF_CHECKPOINT" \
@@ -153,42 +151,37 @@ run_predict() {
         --device="$DEVICE"
     
     echo ""
-    echo "✓ 预测完成！结果保存在: $output_file"
+    echo "✓ Prediction completed! Saved to: $output_file"
 }
 
-# 多时间点轨迹预测
+# Trajectory Prediction
 run_trajectory() {
     echo "========================================"
-    echo "运行多时间点轨迹预测"
+    echo "Running Trajectory Prediction"
     echo "========================================"
     
-    # 检查必要文件
     check_file "$TEMPORAL_DATA_PATH"
     check_file "$AE_CHECKPOINT"
     check_file "$RTF_CHECKPOINT"
     
-    # 创建输出目录
     create_output_dir
     
-    # 参数设置（支持环境变量覆盖）
     local time_points=${TIME_POINTS:-"[0.0,0.5,1.0,1.5,2.0]"}
     local sample_steps=${SAMPLE_STEPS:-$SAMPLE_STEPS}
     local cfg_scale=${CFG_SCALE:-$CFG_SCALE}
     local batch_size=${BATCH_SIZE:-$BATCH_SIZE}
     
-    # 输出文件名
     local output_file="${OUTPUT_DIR}/trajectory.h5ad"
     
     echo ""
-    echo "配置参数："
-    echo "  时间点序列: $time_points"
-    echo "  采样步数: $sample_steps"
-    echo "  CFG 强度: $cfg_scale"
-    echo "  批次大小: $batch_size"
-    echo "  输出文件: $output_file"
+    echo "Parameters:"
+    echo "  Time Points: $time_points"
+    echo "  Steps: $sample_steps"
+    echo "  CFG Scale: $cfg_scale"
+    echo "  Batch Size: $batch_size"
+    echo "  Output File: $output_file"
     echo ""
     
-    # 运行推理
     python utils/inference.py predict_trajectory \
         --ae_checkpoint="$AE_CHECKPOINT" \
         --rtf_checkpoint="$RTF_CHECKPOINT" \
@@ -201,35 +194,30 @@ run_trajectory() {
         --device="$DEVICE"
     
     echo ""
-    echo "✓ 轨迹预测完成！结果保存在: $output_file"
+    echo "✓ Trajectory prediction completed! Saved to: $output_file"
 }
 
-# 仅编码到潜空间
+# Encode to Latent Space
 run_encode() {
     echo "========================================"
-    echo "编码数据到潜空间"
+    echo "Encoding Data to Latent Space"
     echo "========================================"
     
-    # 检查必要文件
     check_file "$TEMPORAL_DATA_PATH"
     check_file "$AE_CHECKPOINT"
     
-    # 创建输出目录
     create_output_dir
     
-    # 参数设置
     local batch_size=${BATCH_SIZE:-$BATCH_SIZE}
     
-    # 输出文件名
     local output_file="${OUTPUT_DIR}/latent_encoded.h5ad"
     
     echo ""
-    echo "配置参数："
-    echo "  批次大小: $batch_size"
-    echo "  输出文件: $output_file"
+    echo "Parameters:"
+    echo "  Batch Size: $batch_size"
+    echo "  Output File: $output_file"
     echo ""
     
-    # 运行编码
     python utils/inference.py encode_data \
         --ae_checkpoint="$AE_CHECKPOINT" \
         --input_data="$TEMPORAL_DATA_PATH" \
@@ -238,22 +226,46 @@ run_encode() {
         --device="$DEVICE"
     
     echo ""
-    echo "✓ 编码完成！结果保存在: $output_file"
+    echo "✓ Encoding completed! Saved to: $output_file"
+}
+
+# Visualization
+run_visualize() {
+    echo "========================================"
+    echo "Visualizing Results"
+    echo "========================================"
+    
+    local viz_file=${VIZ_FILE:-"${OUTPUT_DIR}/trajectory.h5ad"}
+    local output_img="${viz_file%.*}.png"
+    
+    check_file "$viz_file"
+    
+    echo ""
+    echo "Parameters:"
+    echo "  Input File: $viz_file"
+    echo "  Output Image: $output_img"
+    echo ""
+    
+    python utils/inference.py visualize \
+        --data_path="$viz_file" \
+        --output_path="$output_img" \
+        --basis="umap"
+        
+    echo ""
+    echo "✓ Visualization completed! Saved to: $output_img"
 }
 
 # ============================================================================
-# 主程序
+# Main Execution
 # ============================================================================
 
-# 检查是否有参数
 if [ $# -eq 0 ]; then
-    echo "❌ 错误: 缺少推理模式参数"
+    echo "❌ Error: Missing inference mode"
     echo ""
     show_help
     exit 1
 fi
 
-# 解析命令
 MODE=$1
 
 case $MODE in
@@ -266,11 +278,14 @@ case $MODE in
     encode)
         run_encode
         ;;
+    visualize)
+        run_visualize
+        ;;
     help|--help|-h)
         show_help
         ;;
     *)
-        echo "❌ 错误: 未知的推理模式 '$MODE'"
+        echo "❌ Error: Unknown mode '$MODE'"
         echo ""
         show_help
         exit 1
@@ -279,6 +294,5 @@ esac
 
 echo ""
 echo "========================================"
-echo "任务完成！"
+echo "Task Completed!"
 echo "========================================"
-

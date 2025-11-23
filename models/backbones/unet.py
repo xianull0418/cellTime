@@ -183,7 +183,7 @@ class UNetBackbone(BackboneBase):
             curr_channels = out_channels
             self.skip_connections.append(curr_channels) # Block 1 output
             self.skip_connections.append(curr_channels) # Block 2 output
-            self.skip_connections.append(curr_channels) # Downsample output
+            # self.skip_connections.append(curr_channels) # Downsample output (不存了)
             
         # Middle 路径
         mid_channels = base_channels * channel_mults[-1]
@@ -195,18 +195,37 @@ class UNetBackbone(BackboneBase):
         self.up_blocks = nn.ModuleList()
         reversed_mults = list(reversed(channel_mults[:-1]))
         
+        # 模拟 Middle path 的输入被 pop 掉 (对应 forward 中的 skips.pop() 扔掉 downsample 前的特征)
+        # 但是我们在 forward 里，middle 的输入是 downsample 的输出，而 downsample 的输出我们没存进栈
+        # 所以 forward 里 skips 栈顶直接就是 最后一层 Down Block 的 Res2 输出
+        
+        # 让我们重新理清 forward 的逻辑：
+        # 1. Down Loop:
+        #    - Res1 -> append
+        #    - Res2 -> append
+        #    - Down -> (不 append) -> 传给下一层或 Middle
+        
+        # 2. Middle:
+        #    - 接收 Down 的输出
+        
+        # 3. Up Loop:
+        #    - 栈顶是 Res2 输出。
+        #    - 我们需要 pop Res2 做 concat
+        #    - 还需要 pop Res1 扔掉
+        
+        # 所以 __init__ 这里的逻辑应该是：
+        
         for level, mult in enumerate(reversed_mults):
             out_channels = base_channels * mult
             
             # 需要加上 skip connection 的通道数
-            # 这里的 skip connection 逻辑稍微简化，标准 UNet 每个 resolution 有多个 skip
-            skip_ch = self.skip_connections.pop()
+            skip_ch = self.skip_connections.pop() # Res2
+            _ = self.skip_connections.pop()       # Res1 (扔掉)
             
             block = nn.ModuleList([
                 # 上采样 + 卷积
                 Upsample(curr_channels), 
-                # 接一个残差块处理融合后的特征 (这里简化处理，通常是 Concat 后再卷积)
-                # 为了保持通道数对齐，我们在 forward 里做 concat，这里定义卷积核大小
+                # 接一个残差块处理融合后的特征
                 nn.Conv1d(curr_channels + skip_ch, out_channels, kernel_size=3, padding=1),
                 ResidualBlock(out_channels, out_channels, emb_dim, dropout),
             ])
@@ -255,27 +274,33 @@ class UNetBackbone(BackboneBase):
             skips.append(h)
             
             h = downsample(h)
-            # Downsample output 也作为一个 skip? 通常 UNet 是把同一分辨率的特征图传过去
-            # 这里我们只存 block 的输出
+            # skips.append(h)  <-- 不存储 downsample 输出
             
         # 4. Middle Path
         h = self.mid_block1(h, emb)
         h = self.mid_block2(h, emb)
         
         # 5. Up Path
+        # skips 栈现在是: [In, B1_out, B2_out, B3_out, B4_out, ...]
+        # 栈顶是最后一层的 Res2_out，正好是 Up path 第一层需要的 skip
+        
+        # _ = skips.pop()  <-- 不需要 pop，因为 downsample 输出没存
+        
         for block in self.up_blocks:
             upsample, conv_fuse, res_block = block
             
             # 上采样
             h = upsample(h)
             
-            # 获取对应的 Skip connection (需要正确的索引)
-            # 注意：这里简化的 UNet 结构可能需要调整 skip 的获取逻辑以严格匹配维度
-            # 简单的做法：取最近的一个匹配维度的 skip
+            # 获取对应的 Skip connection
+            # skips 存入顺序: Res1_out, Res2_out
+            # 我们需要 Res2_out
             
-            # 在标准的 UNet 实现中，Down block 的每次输出都会被 Up block 使用
-            # 这里我们简单取最后一个存入的 skip (假设是对称的)
             skip = skips.pop() 
+            
+            # 还需要 pop 掉 Res1_out，因为它没被用到
+            _ = skips.pop()
+            
             # 如果维度因为 padding 问题不匹配，需要 crop 或 pad
             if h.shape[-1] != skip.shape[-1]:
                 h = torch.nn.functional.interpolate(h, size=skip.shape[-1], mode="nearest")

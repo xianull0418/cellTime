@@ -153,7 +153,17 @@ def create_backbone(backbone_type: str, backbone_config: dict, latent_dim: int):
         return MLPBackbone(latent_dim=latent_dim, **backbone_config)
     elif backbone_type == 'unet':
         from models.backbones.unet import UNetBackbone
-        return UNetBackbone(latent_dim=latent_dim, **backbone_config)
+        # 移除 latent_dim，因为它已经在 backbone_config 中（如果存在），或者通过 UNetBackbone 签名处理
+        # 这里 UNetBackbone 的 __init__ 第一个参数是 latent_dim
+        # 如果 backbone_config 中也包含 latent_dim，会导致重复传参错误
+        
+        # 复制一份配置以防修改原字典
+        config = dict(backbone_config)
+        # 如果配置里有 latent_dim，先移除，防止重复
+        if 'latent_dim' in config:
+            config.pop('latent_dim')
+            
+        return UNetBackbone(latent_dim=latent_dim, **config)
     else:
         raise ValueError(f"Unknown backbone type: {backbone_type}")
 
