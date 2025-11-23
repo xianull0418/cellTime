@@ -151,6 +151,9 @@ def create_backbone(backbone_type: str, backbone_config: dict, latent_dim: int):
     elif backbone_type == 'mlp':
         from models.backbones.mlp import MLPBackbone
         return MLPBackbone(latent_dim=latent_dim, **backbone_config)
+    elif backbone_type == 'unet':
+        from models.backbones.unet import UNetBackbone
+        return UNetBackbone(latent_dim=latent_dim, **backbone_config)
     else:
         raise ValueError(f"Unknown backbone type: {backbone_type}")
 

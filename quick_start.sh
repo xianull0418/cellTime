@@ -94,14 +94,14 @@ python train_rtf.py \
   --ae_checkpoint=${AE_OUTPUT_DIR}/checkpoints/last.ckpt \
   --data_path=${TEMPORAL_DATA_PATH} \
   --model__mode=direct \
-  --model__backbone=dit \
+  --model__backbone=unet \
   --model__latent_dim=${LATENT_DIM} \
   --training__batch_size=128 \
   --training__learning_rate=1e-4 \
-  --training__max_epochs=100 \
+  --training__max_epochs=10 \
   --training__sample_steps=50 \
   --training__cfg_scale=2.0 \
-  --logging__output_dir=output/rtf_direct_dit_${AE_MODE}_1121_debug \
+  --logging__output_dir=output/rtf_direct_unet_${AE_MODE}_1123_debug \
   $RTF_EXTRA_ARGS
 
 echo ""

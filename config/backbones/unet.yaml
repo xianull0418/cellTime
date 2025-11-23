@@ -1,0 +1,11 @@
+# UNet 骨干网络配置
+latent_dim: 128
+in_channels: 1
+base_channels: 64
+channel_mults: [1, 2, 4]
+dropout: 0.1
+use_time_embedding: true
+time_emb_dim: 256
+use_cond: false
+cond_dim: 0
+
