@@ -89,41 +89,35 @@ def load_anndata(
         # 确保 var 索引是唯一的
         adata.var_names_make_unique()
         
-        # 创建一个新的 AnnData，包含目标基因
-        # 使用 pandas 的 reindex 功能，这会自动处理缺失值（填 NaN）
-        # 注意：我们需要在 X 上操作，而不是 DataFrame，以节省内存
-        
-        # 找出交集基因
-        common_genes = list(set(adata.var_names) & set(target_genes))
+        # 检查重叠 (参考 scimilarity)
+        overlap = len(set(adata.var_names) & set(target_genes))
         if verbose:
-            print(f"  - 共有基因数: {len(common_genes)}")
+            print(f"  - 共有基因数: {overlap}")
+        
+        if overlap < 100 and verbose:
+            print(f"Warning: 共有基因数 ({overlap}) 较少，请检查基因命名是否一致")
             
-        # 创建新的空的 AnnData
-        # 注意：scipy sparse matrix 不支持 reindex，所以如果 X 是稀疏的，可能需要转换
-        # 但考虑到内存，我们先尝试构建一个新的
+        # 记录原始基因
+        orig_genes = adata.var_names.values
         
-        # 方法：先创建一个全零矩阵
-        # 然后填入共有基因的值
+        # 创建一个新的 AnnData，包含目标基因
+        # 使用 pandas 的 reindex 功能
         
-        # 为了简单起见，如果内存允许，我们可以使用 pandas
-        # 但 28k * 3k cells 并不大，应该没问题
-        
-        # 更高效的方法：
-        # 1. 扩展原始数据，补全缺失基因
-        # 2. 排序以匹配 target_genes
-        
-        # 使用 anndata 的 concat 功能可能比较复杂，直接操作 DataFrame
+        # 为了优化内存，强制使用 float32
         if hasattr(adata.X, "toarray"):
-            X_df = pd.DataFrame(adata.X.toarray(), index=adata.obs_names, columns=adata.var_names)
+            X_mat = adata.X.toarray()
         else:
-            X_df = pd.DataFrame(adata.X, index=adata.obs_names, columns=adata.var_names)
+            X_mat = adata.X
+            
+        X_df = pd.DataFrame(X_mat, index=adata.obs_names, columns=adata.var_names)
             
         # Reindex
+        # fill_value=0.0
         X_new = X_df.reindex(columns=target_genes, fill_value=0.0)
         
         # 创建新 AnnData
         new_adata = sc.AnnData(
-            X=X_new.values,
+            X=X_new.values.astype(np.float32),
             obs=adata.obs.copy(),
             var=pd.DataFrame(index=target_genes)
         )
@@ -131,12 +125,15 @@ def load_anndata(
         # 复制 layers
         for layer_name, layer_data in adata.layers.items():
             if hasattr(layer_data, "toarray"):
-                layer_df = pd.DataFrame(layer_data.toarray(), index=adata.obs_names, columns=adata.var_names)
+                layer_mat = layer_data.toarray()
             else:
-                layer_df = pd.DataFrame(layer_data, index=adata.obs_names, columns=adata.var_names)
-            
+                layer_mat = layer_data
+                
+            layer_df = pd.DataFrame(layer_mat, index=adata.obs_names, columns=adata.var_names)
             new_layer = layer_df.reindex(columns=target_genes, fill_value=0.0)
-            new_adata.layers[layer_name] = new_layer.values
+            new_adata.layers[layer_name] = new_layer.values.astype(np.float32)
+            
+        new_adata.uns["orig_genes"] = orig_genes
             
         adata = new_adata
         if verbose:
