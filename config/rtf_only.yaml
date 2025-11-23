@@ -1,0 +1,42 @@
+# RTF Only Configuration
+model:
+  backbone: unet  # unet, dit, mlp
+  n_genes: 3000   # Input dimension (must match dataset)
+  ln_noise: true
+  normalize: false # Whether to normalize inputs to unit sphere
+  use_cond: false
+  cond_dim: null
+
+training:
+  batch_size: 128
+  learning_rate: 1e-4
+  weight_decay: 1e-5
+  max_epochs: 100
+  sample_steps: 50
+  cfg_scale: 2.0
+  sample_every_n_epochs: 5
+  
+  scheduler:
+    type: cosine
+    T_max: 100
+
+data:
+  data_path: null
+  valid_pairs_only: true
+  time_col: time
+  next_cell_col: next_cell_id
+  num_workers: 4
+  pin_memory: true
+  target_genes_path: gene_order.tsv
+
+logging:
+  output_dir: output/rtf_only
+  log_every_n_steps: 50
+  save_samples: true
+
+accelerator:
+  accelerator: auto
+  devices: auto
+  precision: 32
+  gradient_clip_val: 1.0
+
