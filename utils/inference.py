@@ -417,6 +417,11 @@ def visualize(
     adata = sc.read_h5ad(data_path)
     
     print("Preprocessing...")
+    # 清洗数据：处理 NaN 和负值
+    if isinstance(adata.X, np.ndarray):
+        adata.X = np.nan_to_num(adata.X, nan=0.0)
+        adata.X = np.maximum(adata.X, 0.0)
+    
     # 基础预处理用于可视化
     sc.pp.normalize_total(adata, target_sum=1e4)
     sc.pp.log1p(adata)
@@ -434,11 +439,75 @@ def visualize(
     # 设置绘图风格
     sc.set_figure_params(dpi=150, frameon=False, figsize=(6, 6))
     
-    # 创建画布
-    if basis == "umap":
-        sc.pl.umap(adata, color=color_by if color_by in adata.obs.columns else None, show=False)
+    # 检查是否存在 trajectory_info，如果存在则尝试按时间着色
+    if "trajectory_info" in adata.uns:
+        # 这里的 adata 仅包含最后时刻的数据（因为 read_h5ad 默认读 X）
+        # 如果我们想可视化轨迹，我们需要从 layers 重建
+        print("Detected trajectory data. Reconstructing full trajectory for visualization...")
+        
+        traj_info = adata.uns["trajectory_info"]
+        time_points = traj_info["time_points"]
+        
+        # 收集所有时间点的数据
+        adatas = []
+        # 注意：adata.X 实际上是 t_last (如 2.0)
+        # layers 中存储了其他时间点
+        
+        # 为了统一，我们从 layers 提取（包括最后时刻，如果 infer 脚本逻辑是一致的）
+        # 在 predict_trajectory 中：X 是 t_last，layers 包含 t_0 到 t_last-1
+        
+        for t in time_points[:-1]:
+            key = f"t_{t}"
+            if key in adata.layers:
+                # 创建新的 AnnData
+                ad_t = sc.AnnData(X=adata.layers[key].copy(), obs=adata.obs.copy())
+                ad_t.obs["time"] = float(t)  # 使用 float 以便显示连续颜色
+                adatas.append(ad_t)
+        
+        # 添加最后时刻 (X)
+        last_t = time_points[-1]
+        ad_last = sc.AnnData(X=adata.X.copy(), obs=adata.obs.copy())
+        ad_last.obs["time"] = float(last_t)
+        adatas.append(ad_last)
+        
+        # 合并
+        adata_full = sc.concat(adatas)
+        print(f"Full trajectory shape: {adata_full.shape}")
+        
+        # 重新预处理合并后的数据
+        # 清洗数据
+        if isinstance(adata_full.X, np.ndarray):
+            adata_full.X = np.nan_to_num(adata_full.X, nan=0.0)
+            adata_full.X = np.maximum(adata_full.X, 0.0)
+            
+        sc.pp.normalize_total(adata_full, target_sum=1e4)
+        sc.pp.log1p(adata_full)
+        sc.pp.highly_variable_genes(adata_full, min_mean=0.0125, max_mean=3, min_disp=0.5)
+        adata_full = adata_full[:, adata_full.var.highly_variable]
+        sc.pp.scale(adata_full, max_value=10)
+        sc.tl.pca(adata_full, svd_solver='arpack', n_comps=n_pca)
+        
+        if basis == "umap":
+            # 增加 n_neighbors 以更好地保留全局轨迹结构
+            sc.pp.neighbors(adata_full, n_neighbors=30, n_pcs=40)
+            sc.tl.umap(adata_full, min_dist=0.3)
+            
+            # 尝试同时绘制时间和细胞类型（如果存在）
+            color_cols = ["time"]
+            if "cell_type" in adata_full.obs.columns:
+                color_cols.append("cell_type")
+            
+            # 使用 viridis 颜色映射显示时间连续性
+            sc.pl.umap(adata_full, color=color_cols, show=False, color_map="viridis")
+        else:
+            sc.pl.pca(adata_full, color=["time"], show=False, color_map="viridis")
+            
     else:
-        sc.pl.pca(adata, color=color_by if color_by in adata.obs.columns else None, show=False)
+        # 创建画布
+        if basis == "umap":
+            sc.pl.umap(adata, color=color_by if color_by in adata.obs.columns else None, show=False)
+        else:
+            sc.pl.pca(adata, color=color_by if color_by in adata.obs.columns else None, show=False)
         
     # 保存图像
     plt.title(f"Visualization of Predictions ({basis.upper()})", fontsize=12)

@@ -28,11 +28,11 @@ OUTPUT_DIR="output/rtf_only_experiment"
 
 # 骨干网络选择: "mlp", "dit", "unet"
 # 注意: UNet 要求基因数能被 2^(depth-1) 整除。对于任意基因数，推荐使用 MLP 或 DiT。
-BACKBONE="dit" 
+BACKBONE="mlp" 
 
 # 训练参数
 BATCH_SIZE=128
-MAX_EPOCHS=100
+MAX_EPOCHS=150
 LEARNING_RATE=1e-4
 
 # ============================================================================

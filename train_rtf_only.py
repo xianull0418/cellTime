@@ -42,6 +42,20 @@ def train(
         cli_cfg = OmegaConf.from_dotlist([f"{k}={v}" for k, v in flat_kwargs.items()])
         cfg = OmegaConf.merge(cfg, cli_cfg)
         
+    # Pre-calculate n_genes from target_genes_path if available
+    # This is crucial because the model (backbone) is initialized in __init__ using cfg.model.n_genes,
+    # but the actual data dimension is determined by target_genes.
+    if hasattr(cfg.data, 'target_genes_path') and cfg.data.target_genes_path:
+        target_genes_path = Path(cfg.data.target_genes_path)
+        if target_genes_path.exists():
+            print(f"Loading target genes from {target_genes_path}...")
+            with open(target_genes_path, 'r') as f:
+                target_genes = [line.strip() for line in f if line.strip()]
+            n_genes = len(target_genes)
+            if cfg.model.n_genes != n_genes:
+                print(f"Overriding n_genes from {cfg.model.n_genes} to {n_genes}")
+                cfg.model.n_genes = n_genes
+
     print("=" * 80)
     print("Training Configuration:")
     print("=" * 80)
