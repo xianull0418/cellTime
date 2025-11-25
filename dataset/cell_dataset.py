@@ -10,6 +10,8 @@ from torch.utils.data import Dataset
 import scanpy as sc
 from pathlib import Path
 from typing import Union, Optional, List
+from .scbank.databank import DataBank
+from .scbank.gene_vocab import GeneVocab
 
 try:
     import anndata as ad
@@ -234,6 +236,45 @@ class StaticCellDataset(Dataset):
             verbose: 是否打印信息
             seed: 随机种子
         """
+        self.use_scbank = False
+        self.rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
+
+        if isinstance(data, (str, Path)):
+            path = Path(data)
+            if path.is_dir():
+                # Check for existing scBank
+                if (path / "manifest.json").exists():
+                    if verbose: print(f"Loading from scBank: {path}")
+                    self.use_scbank = True
+                    self.db = DataBank.from_path(path)
+                # Check for h5ad directory to auto-convert/load cache
+                elif any(path.glob("*.h5ad")):
+                    cache_dir = path / ".scbank_cache"
+                    # Check for gene vocabulary
+                    vocab_file = path / "gene_vocab.json"
+                    if not vocab_file.exists():
+                        vocab_file = path / "gene_order.tsv"
+                        
+                    if (cache_dir / "manifest.json").exists():
+                         if verbose: print(f"Loading from cached scBank: {cache_dir}")
+                         self.use_scbank = True
+                         self.db = DataBank.from_path(cache_dir)
+                    elif vocab_file.exists():
+                         if verbose: print(f"Converting h5ad directory to scBank cache at {cache_dir}...")
+                         vocab = GeneVocab.from_file(vocab_file)
+                         self.db = DataBank.from_h5ad_dir(path, vocab, to=cache_dir)
+                         self.use_scbank = True
+        
+        if self.use_scbank:
+             self.ds = self.db.main_data.data
+             self.n_cells = len(self.ds)
+             self.n_genes = len(self.db.gene_vocab)
+             if verbose:
+                print(f"StaticCellDataset (scBank) 初始化完成:")
+                print(f"  - 细胞数: {self.n_cells}")
+                print(f"  - 基因数: {self.n_genes}")
+             return
+
         if isinstance(data, (str, Path)):
             self.adata = load_anndata(
                 data, 
@@ -272,9 +313,6 @@ class StaticCellDataset(Dataset):
         X = X.toarray() if hasattr(X, "toarray") else X
         self.expressions = torch.tensor(X, dtype=torch.float32)
         
-        # 随机数生成器
-        self.rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
-        
         if verbose:
             print(f"StaticCellDataset 初始化完成:")
             print(f"  - 细胞数: {self.n_cells}")
@@ -292,6 +330,17 @@ class StaticCellDataset(Dataset):
         """
         # 随机采样（忽略 idx）
         rand_idx = int(self.rng.integers(0, self.n_cells))
+        
+        if self.use_scbank:
+            item = self.ds[rand_idx]
+            # item keys: 'id', 'genes', 'expressions'
+            x = torch.zeros(self.n_genes, dtype=torch.float32)
+            if len(item['genes']) > 0:
+                genes_idx = torch.tensor(item['genes'], dtype=torch.long)
+                exprs = torch.tensor(item['expressions'], dtype=torch.float32)
+                x[genes_idx] = exprs
+            return x
+
         x = self.expressions[rand_idx]
         return x
 

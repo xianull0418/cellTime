@@ -9,7 +9,7 @@ from scipy.sparse import spmatrix, csr_matrix
 from anndata import AnnData
 from datasets import Dataset, load_dataset
 
-from scgpt.tokenizer import GeneVocab
+from .gene_vocab import GeneVocab
 from .data import DataTable, MetaInfo
 from .setting import Setting
 from . import logger
@@ -203,6 +203,113 @@ class DataBank:
     @classmethod
     def batch_from_anndata(cls, adata: List[AnnData], to: Union[Path, str]) -> Self:
         raise NotImplementedError
+
+    @classmethod
+    def from_h5ad_dir(
+        cls,
+        data_path: Union[str, Path],
+        vocab: Union[GeneVocab, Mapping[str, int]],
+        to: Union[Path, str],
+        main_table_key: str = "X",
+        token_col: str = "gene name",
+        immediate_save: bool = True,
+        glob_pattern: str = "*.h5ad",
+    ) -> Self:
+        """
+        Create a DataBank from a directory of h5ad files.
+        """
+        import scanpy as sc
+        import pandas as pd
+
+        if isinstance(data_path, str):
+            data_path = Path(data_path)
+        if isinstance(to, str):
+            to = Path(to)
+        
+        to.mkdir(parents=True, exist_ok=True)
+
+        if isinstance(vocab, (Path, str)):
+            vocab = GeneVocab.from_file(vocab)
+        elif isinstance(vocab, Mapping) and not isinstance(vocab, GeneVocab):
+            vocab = GeneVocab.from_dict(vocab)
+        
+        files = sorted(list(data_path.glob(glob_pattern)))
+        if not files:
+            raise ValueError(f"No files found in {data_path} with pattern {glob_pattern}")
+
+        db = cls(
+            meta_info=MetaInfo(on_disk_path=to, on_disk_format="parquet"),
+            gene_vocab=vocab,
+            settings=Setting(immediate_save=immediate_save),
+        )
+
+        # Process files and save as parquet shards
+        parquet_files = []
+        for i, f in enumerate(files):
+            logger.info(f"Processing {f.name} ({i+1}/{len(files)})...")
+            try:
+                adata = sc.read_h5ad(f)
+                
+                # Ensure token_col exists
+                if token_col not in adata.var:
+                    # Try using index if token_col not found
+                     if adata.var.index.name == token_col:
+                         adata.var[token_col] = adata.var.index
+                     else:
+                        # fallback to index if it looks like gene names
+                        adata.var[token_col] = adata.var.index
+
+                # Basic validation
+                tokens = adata.var[token_col].tolist()
+                # Simplified validation to avoid overhead
+                
+                _ind2ind = _map_ind(tokens, db.gene_vocab)
+                
+                # Load layer (only X for now as per requirement simplification)
+                data_key = main_table_key
+                if data_key == "X":
+                    data = adata.X
+                elif data_key in adata.layers:
+                    data = adata.layers[data_key]
+                else:
+                     logger.warning(f"Key {data_key} not found in {f.name}, using X")
+                     data = adata.X
+
+                tokenized_data = db._tokenize(data, _ind2ind)
+                
+                # Create Dataset and save to parquet
+                ds = Dataset.from_dict(tokenized_data)
+                shard_path = to / f"shard_{i}.parquet"
+                ds.to_parquet(shard_path)
+                parquet_files.append(str(shard_path))
+                
+                # Clean up memory
+                del adata
+                del data
+                del tokenized_data
+                del ds
+
+            except Exception as e:
+                logger.error(f"Failed to process {f}: {e}")
+                continue
+
+        if not parquet_files:
+            raise ValueError("No files were successfully processed.")
+
+        # Load all parquet files as a single Dataset
+        logger.info(f"Loading {len(parquet_files)} shards as a single dataset...")
+        full_ds = load_dataset("parquet", data_files=parquet_files, split="train", cache_dir=str(to))
+        
+        data_table = DataTable(
+            name=main_table_key,
+            data=full_ds,
+        )
+
+        db.main_table_key = main_table_key
+        db.update_datatables(new_tables=[data_table], immediate_save=immediate_save)
+        
+        return db
+
 
     @classmethod
     def from_path(cls, path: Union[Path, str]) -> Self:
