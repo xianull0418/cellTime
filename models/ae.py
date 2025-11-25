@@ -57,7 +57,7 @@ class Autoencoder(nn.Module):
             hidden_dim=hidden_dim.copy(),
             dropout=dropout_rate,
         )
-    
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """编码到潜空间"""
         return self.encoder(x)
@@ -244,8 +244,11 @@ class AESystem(pl.LightningModule):
     
     def configure_optimizers(self):
         """配置优化器和调度器"""
+        # 过滤掉 requires_grad=False 的参数
+        params = filter(lambda p: p.requires_grad, self.parameters())
+        
         optimizer = torch.optim.AdamW(
-            self.parameters(),
+            params,
             lr=self.cfg.training.learning_rate,
             weight_decay=self.cfg.training.weight_decay,
         )
@@ -285,8 +288,19 @@ class AESystem(pl.LightningModule):
             # 如果配置了 n_genes，将其作为 max_genes 传递给数据集
             max_genes = self.cfg.model.n_genes if self.cfg.model.n_genes > 0 else None
             
+            # 获取词汇表路径
+            vocab_path = None
+            if hasattr(self.cfg.data, 'vocab_path') and self.cfg.data.vocab_path:
+                vocab_path = self.cfg.data.vocab_path
+
+            # 对大规模数据，不应在此处创建 full_dataset 然后进行 random_split
+            # 而是应该利用 dataset 的能力进行 split
+            # 由于 StaticCellDataset 目前不支持内置 split，我们仍然使用 random_split
+            # 但要注意 scbank 的实现是懒加载的，所以初始化 full_dataset 应该很快
+            
             full_dataset = StaticCellDataset(
                 self.cfg.data.data_path,
+                vocab_path=vocab_path,  # 传递词汇表路径
                 max_genes=max_genes,
                 target_genes=target_genes,
                 verbose=True,

@@ -22,6 +22,7 @@ training:
 
 data:
   data_path: null  # 数据路径，从命令行指定
+  vocab_path: null # 基因词汇表路径（可选），如果提供则强制使用此词表
   train_split: 0.8  # 训练集比例
   num_workers: 4  # 数据加载线程数
   pin_memory: true  # 是否固定内存
@@ -37,4 +38,3 @@ accelerator:
   devices: auto  # 设备数量
   precision: 32  # 精度：32/16
   gradient_clip_val: 1.0  # 梯度裁剪值
-

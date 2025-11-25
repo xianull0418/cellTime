@@ -219,6 +219,7 @@ class StaticCellDataset(Dataset):
         self,
         data: Union[str, Path, "ad.AnnData"],
         *,
+        vocab_path: Optional[Union[str, Path]] = None,
         layer: Optional[str] = "log1p",
         max_genes: Optional[int] = None,
         target_genes: Optional[List[str]] = None,
@@ -229,6 +230,8 @@ class StaticCellDataset(Dataset):
         """
         Args:
             data: 数据路径或 AnnData 对象
+            vocab_path: 基因词汇表路径（可选）。如果提供，将强制使用此词汇表，
+                        并作为 scBank 的 gene_vocab.json 或 gene_order.tsv 使用。
             layer: 使用的 layer 名称
             max_genes: 最大基因数（自动选择高变基因）
             target_genes: 目标基因列表（用于映射）
@@ -247,23 +250,44 @@ class StaticCellDataset(Dataset):
                     if verbose: print(f"Loading from scBank: {path}")
                     self.use_scbank = True
                     self.db = DataBank.from_path(path)
+                    # 如果指定了 vocab_path，检查是否匹配（可选警告）
+                    if vocab_path and verbose:
+                         print(f"Warning: vocab_path provided but loading existing scBank at {path}. "
+                               f"Using vocabulary from scBank.")
+
                 # Check for h5ad directory to auto-convert/load cache
                 elif any(path.glob("*.h5ad")):
                     cache_dir = path / ".scbank_cache"
-                    # Check for gene vocabulary
-                    vocab_file = path / "gene_vocab.json"
-                    if not vocab_file.exists():
-                        vocab_file = path / "gene_order.tsv"
+                    
+                    # Determine vocab file
+                    vocab_file = None
+                    if vocab_path:
+                        vocab_file = Path(vocab_path)
+                        if not vocab_file.exists():
+                            raise FileNotFoundError(f"指定的词汇表文件不存在: {vocab_file}")
+                    else:
+                        # 自动寻找
+                        vocab_file = path / "gene_vocab.json"
+                        if not vocab_file.exists():
+                            vocab_file = path / "gene_order.tsv"
                         
                     if (cache_dir / "manifest.json").exists():
                          if verbose: print(f"Loading from cached scBank: {cache_dir}")
                          self.use_scbank = True
                          self.db = DataBank.from_path(cache_dir)
-                    elif vocab_file.exists():
+                         # 简单的校验：如果提供了 vocab_path，我们可以检查缓存的 vocab 大小是否匹配
+                         # 或者重新生成缓存（如果需要更严格的校验）
+                         
+                    elif vocab_file and vocab_file.exists():
                          if verbose: print(f"Converting h5ad directory to scBank cache at {cache_dir}...")
+                         if verbose: print(f"Using gene vocabulary from: {vocab_file}")
+                         
                          vocab = GeneVocab.from_file(vocab_file)
                          self.db = DataBank.from_h5ad_dir(path, vocab, to=cache_dir)
                          self.use_scbank = True
+                    elif verbose:
+                        print(f"Warning: No gene vocabulary found in {path} and no vocab_path provided. "
+                              "Cannot convert to scBank. Falling back to loading single file (if applicable) or failing.")
         
         if self.use_scbank:
              self.ds = self.db.main_data.data
