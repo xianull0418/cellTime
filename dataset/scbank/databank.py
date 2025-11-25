@@ -15,6 +15,86 @@ from .setting import Setting
 from . import logger
 
 
+def _process_single_file(
+    file_path: Path, 
+    to_path: Path, 
+    vocab: GeneVocab, 
+    main_table_key: str, 
+    token_col: str,
+    index: int
+) -> Optional[str]:
+    """
+    Process a single h5ad file and save as parquet shard.
+    Returns path to saved parquet file or None if failed.
+    """
+    import scanpy as sc
+    import pandas as pd
+    from datasets import Dataset
+    
+    try:
+        # Use a fresh DataBank instance-like context just for utils
+        # Actually we just need the tokenization logic
+        # We can instantiate a minimal DataBank or just use the static methods/utils
+        # To reuse _tokenize and _map_ind logic, we can make them standalone or accessible
+        
+        adata = sc.read_h5ad(file_path)
+        
+        # Ensure token_col exists
+        # Re-implement column detection logic here to be self-contained
+        if token_col not in adata.var:
+            if "gene_symbols" in adata.var:
+                token_col = "gene_symbols"
+            elif "feature_name" in adata.var:
+                token_col = "feature_name"
+            elif adata.var.index.name == token_col:
+                 adata.var[token_col] = adata.var.index
+            else:
+                adata.var[token_col] = adata.var.index.tolist()
+
+        tokens = adata.var[token_col].tolist()
+        
+        # Ind2Ind mapping
+        # Re-implement or import _map_ind
+        # Since _map_ind is module-level, we can use it directly if this function is in same module
+        # But we need to pass vocab. 
+        # Note: passing large vocab across processes is okay-ish (readonly shared memory on fork)
+        
+        _ind2ind = _map_ind(tokens, vocab)
+        
+        # Load layer
+        data_key = main_table_key
+        if data_key == "X":
+            data = adata.X
+        elif data_key in adata.layers:
+            data = adata.layers[data_key]
+        else:
+             # logger.warning(f"Key {data_key} not found in {file_path.name}, using X")
+             data = adata.X
+
+        # Tokenize
+        # We need to instantiate a dummy DataBank to call _tokenize or make _tokenize static
+        # Since _tokenize uses self.settings, we can create a dummy one
+        db_dummy = DataBank(meta_info=MetaInfo(), gene_vocab=vocab)
+        tokenized_data = db_dummy._tokenize(data, _ind2ind)
+        
+        # Save to parquet
+        ds = Dataset.from_dict(tokenized_data)
+        shard_path = to_path / f"shard_{index}.parquet"
+        ds.to_parquet(shard_path)
+        
+        # Clean up
+        del adata
+        del data
+        del tokenized_data
+        del ds
+        
+        return str(shard_path)
+
+    except Exception as e:
+        print(f"Failed to process {file_path}: {e}")
+        return None
+
+
 @dataclass
 class DataBank:
     """
@@ -214,12 +294,15 @@ class DataBank:
         token_col: str = "gene name",
         immediate_save: bool = True,
         glob_pattern: str = "*.h5ad",
+        num_workers: int = 16,
     ) -> Self:
         """
         Create a DataBank from a directory of h5ad files.
         """
         import scanpy as sc
         import pandas as pd
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from tqdm import tqdm
 
         if isinstance(data_path, str):
             data_path = Path(data_path)
@@ -243,55 +326,32 @@ class DataBank:
             settings=Setting(immediate_save=immediate_save),
         )
 
-        # Process files and save as parquet shards
+        # Process files and save as parquet shards in parallel
         parquet_files = []
-        for i, f in enumerate(files):
-            logger.info(f"Processing {f.name} ({i+1}/{len(files)})...")
-            try:
-                adata = sc.read_h5ad(f)
-                
-                # Ensure token_col exists
-                if token_col not in adata.var:
-                    # Try using index if token_col not found
-                     if adata.var.index.name == token_col:
-                         adata.var[token_col] = adata.var.index
-                     else:
-                        # fallback to index if it looks like gene names
-                        adata.var[token_col] = adata.var.index
+        logger.info(f"Processing {len(files)} files with {num_workers} workers...")
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks
+            future_to_file = {
+                executor.submit(
+                    _process_single_file, 
+                    f, to, vocab, main_table_key, token_col, i
+                ): f for i, f in enumerate(files)
+            }
+            
+            # Process results as they complete
+            for future in tqdm(as_completed(future_to_file), total=len(files), desc="Converting h5ad"):
+                f = future_to_file[future]
+                try:
+                    result = future.result()
+                    if result:
+                        parquet_files.append(result)
+                except Exception as e:
+                    logger.error(f"Worker failed for {f}: {e}")
 
-                # Basic validation
-                tokens = adata.var[token_col].tolist()
-                # Simplified validation to avoid overhead
-                
-                _ind2ind = _map_ind(tokens, db.gene_vocab)
-                
-                # Load layer (only X for now as per requirement simplification)
-                data_key = main_table_key
-                if data_key == "X":
-                    data = adata.X
-                elif data_key in adata.layers:
-                    data = adata.layers[data_key]
-                else:
-                     logger.warning(f"Key {data_key} not found in {f.name}, using X")
-                     data = adata.X
-
-                tokenized_data = db._tokenize(data, _ind2ind)
-                
-                # Create Dataset and save to parquet
-                ds = Dataset.from_dict(tokenized_data)
-                shard_path = to / f"shard_{i}.parquet"
-                ds.to_parquet(shard_path)
-                parquet_files.append(str(shard_path))
-                
-                # Clean up memory
-                del adata
-                del data
-                del tokenized_data
-                del ds
-
-            except Exception as e:
-                logger.error(f"Failed to process {f}: {e}")
-                continue
+        # Ensure order matches index if needed, but for training shuffle it doesn't strictly matter
+        # Sorting by shard index to be deterministic
+        # parquet_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
 
         if not parquet_files:
             raise ValueError("No files were successfully processed.")
@@ -401,7 +461,7 @@ class DataBank:
 
     def _tokenize(
         self,
-        data: Union[np.ndarray, csr_matrix],
+        data: Union[np.ndarray, csr_matrix, Any],
         ind2ind: Mapping[str, int],
         new_indices: Optional[List[int]] = None,
     ) -> Dict[str, List]:
@@ -424,8 +484,18 @@ class DataBank:
         Returns:
             Dict[str, List]: Tokenized data.
         """
+        # Handle case where data is not numpy array or sparse matrix (e.g. from scanpy/anndata)
+        if hasattr(data, "toarray"):
+             data = data.toarray()
+        elif hasattr(data, "to_numpy"):
+             data = data.to_numpy()
+        
         if not isinstance(data, (np.ndarray, csr_matrix)):
-            raise ValueError("data must be a numpy array or sparse matrix.")
+             # Try converting list or other iterable to numpy array
+             try:
+                 data = np.array(data)
+             except Exception:
+                 raise ValueError(f"data must be a numpy array or sparse matrix, got {type(data)}.")
 
         if isinstance(data, np.ndarray):
             zero_ratio = np.sum(data == 0) / data.size
@@ -806,9 +876,10 @@ def _map_ind(tokens: List[str], vocab: Mapping[str, int]) -> Mapping[int, int]:
         else:
             unmatched_tokens.append(t)
     if len(unmatched_tokens) > 0:
-        logger.warning(
+        # This is expected behavior when filtering genes based on vocab
+        logger.info(
             f"{len(unmatched_tokens)}/{len(tokens)} tokens/genes unmatched "
-            "during vocabulary conversion."
+            "during vocabulary conversion (will be filtered out)."
         )
 
     return ind2ind

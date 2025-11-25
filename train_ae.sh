@@ -1,5 +1,6 @@
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export CUDA_VISIBLE_DEVICES=0
 # Autoencoder Training Script for Large-Scale Single-Cell Data
 # 
 # Usage: ./train_ae.sh [DATA_DIR] [VOCAB_FILE] [OUTPUT_DIR]
@@ -11,7 +12,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
 
 DATA_DIR=${1:-"/gpfs/hybrid/data/downloads/gcloud/arc-scbasecount/2025-02-25/h5ad/GeneFull_Ex50pAS/Homo_sapiens"}
 VOCAB_FILE=${2:-"gene_order.tsv"}
-OUTPUT_DIR=${3:-"output/ae_large_scale"}
+OUTPUT_DIR=${3:-"output/ae_large_scale/1125"}
 
 echo "Starting Autoencoder Training..."
 echo "Data Directory: $DATA_DIR"

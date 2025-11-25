@@ -58,6 +58,29 @@ def train(
             "Example: --data_path=/path/to/data.h5ad"
         )
     
+    # ---------------------------------------------------------
+    # 关键修复：在创建模型前，根据 vocab_path 预先计算 n_genes
+    # ---------------------------------------------------------
+    if hasattr(cfg.data, 'vocab_path') and cfg.data.vocab_path:
+        vocab_path = Path(cfg.data.vocab_path)
+        if vocab_path.exists():
+            try:
+                # 简单的行数统计，避免引入重型依赖
+                with open(vocab_path, 'r') as f:
+                    # 过滤空行
+                    vocab_lines = [line.strip() for line in f if line.strip()]
+                    n_vocab = len(vocab_lines)
+                
+                if n_vocab > 0:
+                    print(f"从词汇表 {vocab_path} 检测到 {n_vocab} 个基因")
+                    if cfg.model.n_genes != n_vocab:
+                        print(f"自动更新 model.n_genes: {cfg.model.n_genes} -> {n_vocab}")
+                        cfg.model.n_genes = n_vocab
+            except Exception as e:
+                print(f"Warning: 尝试读取词汇表失败: {e}")
+        else:
+            print(f"Warning: 指定的词汇表路径不存在: {vocab_path}")
+
     # 打印配置
     print("=" * 80)
     print("训练配置:")

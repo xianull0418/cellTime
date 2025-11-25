@@ -277,13 +277,17 @@ class StaticCellDataset(Dataset):
                          self.db = DataBank.from_path(cache_dir)
                          # 简单的校验：如果提供了 vocab_path，我们可以检查缓存的 vocab 大小是否匹配
                          # 或者重新生成缓存（如果需要更严格的校验）
+                         if self.db.main_table_key is None or self.db.main_table_key not in self.db.data_tables:
+                             if verbose: print(f"Warning: Cached scBank is invalid (no main table). Regenerating...")
+                             self.use_scbank = False # Force regeneration
                          
                     elif vocab_file and vocab_file.exists():
                          if verbose: print(f"Converting h5ad directory to scBank cache at {cache_dir}...")
                          if verbose: print(f"Using gene vocabulary from: {vocab_file}")
                          
                          vocab = GeneVocab.from_file(vocab_file)
-                         self.db = DataBank.from_h5ad_dir(path, vocab, to=cache_dir)
+                         # Set num_workers to utilize high core count (e.g., 64 or more)
+                         self.db = DataBank.from_h5ad_dir(path, vocab, to=cache_dir, num_workers=64)
                          self.use_scbank = True
                     elif verbose:
                         print(f"Warning: No gene vocabulary found in {path} and no vocab_path provided. "
