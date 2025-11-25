@@ -30,6 +30,8 @@ def _process_single_file(
     import scanpy as sc
     import pandas as pd
     from datasets import Dataset
+    from datasets import disable_progress_bar
+    disable_progress_bar()  # Disable inner progress bars
     
     try:
         # Use a fresh DataBank instance-like context just for utils
@@ -877,10 +879,11 @@ def _map_ind(tokens: List[str], vocab: Mapping[str, int]) -> Mapping[int, int]:
             unmatched_tokens.append(t)
     if len(unmatched_tokens) > 0:
         # This is expected behavior when filtering genes based on vocab
-        logger.info(
-            f"{len(unmatched_tokens)}/{len(tokens)} tokens/genes unmatched "
-            "during vocabulary conversion (will be filtered out)."
-        )
+        # logger.info(
+        #     f"{len(unmatched_tokens)}/{len(tokens)} tokens/genes unmatched "
+        #     "during vocabulary conversion (will be filtered out)."
+        # )
+        pass
 
     return ind2ind
 
