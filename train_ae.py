@@ -52,9 +52,11 @@ def train(
         cfg = OmegaConf.merge(cfg, cli_cfg)
     
     # 验证必要参数
-    if cfg.data.data_path is None:
+    # 验证必要参数
+    dataset_type = cfg.data.get("dataset_type", "h5ad")
+    if cfg.data.data_path is None and dataset_type != "parquet":
         raise ValueError(
-            "data_path must be provided via config or command line\n"
+            "data_path must be provided via config or command line for h5ad dataset\n"
             "Example: --data_path=/path/to/data.h5ad"
         )
     

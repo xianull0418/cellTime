@@ -145,8 +145,8 @@ class AESystem(pl.LightningModule):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
         # 数据集
-        self.train_dataset = None
         self.val_dataset = None
+        self.ood_dataset = None
 
     def load_pretrained_weights(self, module: nn.Module, checkpoint_path: str, module_type: str):
         """
@@ -298,41 +298,86 @@ class AESystem(pl.LightningModule):
             # 由于 StaticCellDataset 目前不支持内置 split，我们仍然使用 random_split
             # 但要注意 scbank 的实现是懒加载的，所以初始化 full_dataset 应该很快
             
-            full_dataset = StaticCellDataset(
-                self.cfg.data.data_path,
-                vocab_path=vocab_path,  # 传递词汇表路径
-                max_genes=max_genes,
-                target_genes=target_genes,
-                verbose=True,
-                seed=42,
-                limit_cells=self.cfg.data.get("limit_cells", None),
-            )
+            # 检查数据集类型
+            dataset_type = self.cfg.data.get("dataset_type", "h5ad")
             
-            # 更新 n_genes（如果需要）
-            if self.cfg.model.n_genes != full_dataset.n_genes:
-                if target_genes is not None:
-                    print(f"数据集已映射到目标基因列表，新基因数: {full_dataset.n_genes}")
-                elif max_genes is not None:
-                    print(f"数据集基因数已通过高变基因选择调整为: {full_dataset.n_genes}")
+            if dataset_type == "scbank":
+                # 加载 scBank 数据集
+                train_path = Path(self.cfg.data.scbank_path.train)
+                ood_path = Path(self.cfg.data.scbank_path.ood)
+                
+                # 1. 加载训练集 (包含 train 和 val 的全部数据)
+                if train_path.exists():
+                    full_train_dataset = StaticCellDataset(train_path, verbose=True, seed=42)
+                    
+                    # 动态划分训练集和验证集
+                    n_total = len(full_train_dataset)
+                    train_ratio = self.cfg.data.process.get("train_ratio", 0.95)
+                    n_train = int(train_ratio * n_total)
+                    n_val = n_total - n_train
+                    
+                    self.train_dataset, self.val_dataset = torch.utils.data.random_split(
+                        full_train_dataset,
+                        [n_train, n_val],
+                        generator=torch.Generator().manual_seed(42)
+                    )
+                    print(f"Loaded Train scBank from {train_path}")
+                    print(f"  - Total: {n_total}")
+                    print(f"  - Train split: {n_train}")
+                    print(f"  - Val split: {n_val}")
+                    
+                    # 更新 n_genes
+                    self.cfg.model.n_genes = full_train_dataset.n_genes
+                    print(f"Using dataset.n_genes = {full_train_dataset.n_genes}")
                 else:
-                    print(f"Warning: cfg.model.n_genes ({self.cfg.model.n_genes}) "
-                          f"!= dataset.n_genes ({full_dataset.n_genes})")
-                print(f"Using dataset.n_genes = {full_dataset.n_genes}")
-                self.cfg.model.n_genes = full_dataset.n_genes
+                    raise FileNotFoundError(f"Train scBank not found: {train_path}")
+                
+                # 2. 加载 OOD 验证集
+                if ood_path.exists():
+                    self.ood_dataset = StaticCellDataset(ood_path, verbose=True, seed=42)
+                    print(f"Loaded OOD scBank from {ood_path}")
+                    print(f"  - OOD size: {len(self.ood_dataset)}")
+                else:
+                    print(f"Warning: OOD scBank not found: {ood_path}")
+                    
+            else:
+                # 传统的 h5ad/scbank 加载方式
+                full_dataset = StaticCellDataset(
+                    self.cfg.data.data_path,
+                    vocab_path=vocab_path,  # 传递词汇表路径
+                    max_genes=max_genes,
+                    target_genes=target_genes,
+                    verbose=True,
+                    seed=42,
+                )
+                
+                # 更新 n_genes（如果需要）
+                if self.cfg.model.n_genes != full_dataset.n_genes:
+                    if target_genes is not None:
+                        print(f"数据集已映射到目标基因列表，新基因数: {full_dataset.n_genes}")
+                    elif max_genes is not None:
+                        print(f"数据集基因数已通过高变基因选择调整为: {full_dataset.n_genes}")
+                    else:
+                        print(f"Warning: cfg.model.n_genes ({self.cfg.model.n_genes}) "
+                              f"!= dataset.n_genes ({full_dataset.n_genes})")
+                    print(f"Using dataset.n_genes = {full_dataset.n_genes}")
+                    self.cfg.model.n_genes = full_dataset.n_genes
+                
+                # 划分训练集和验证集
+                n_total = len(full_dataset)
+                n_train = int(self.cfg.data.get("train_split", 0.8) * n_total)
+                n_val = n_total - n_train
+                
+                self.train_dataset, self.val_dataset = torch.utils.data.random_split(
+                    full_dataset,
+                    [n_train, n_val],
+                    generator=torch.Generator().manual_seed(42)
+                )
             
-            # 划分训练集和验证集
-            n_total = len(full_dataset)
-            n_train = int(self.cfg.data.train_split * n_total)
-            n_val = n_total - n_train
-            
-            self.train_dataset, self.val_dataset = torch.utils.data.random_split(
-                full_dataset,
-                [n_train, n_val],
-                generator=torch.Generator().manual_seed(42)
-            )
-            
-            print(f"训练集大小: {len(self.train_dataset)}")
-            print(f"验证集大小: {len(self.val_dataset)}")
+            if self.train_dataset:
+                print(f"训练集大小: {len(self.train_dataset)}")
+            if self.val_dataset:
+                print(f"验证集大小: {len(self.val_dataset)}")
     
     def train_dataloader(self):
         """训练数据加载器"""
@@ -359,6 +404,21 @@ class AESystem(pl.LightningModule):
             pin_memory=self.cfg.data.pin_memory,
             collate_fn=collate_fn_static,
         )
+    
+    def test_dataloader(self):
+        """OOD 验证数据加载器 (作为 test dataloader)"""
+        from dataset import collate_fn_static
+        
+        if self.ood_dataset:
+            return DataLoader(
+                self.ood_dataset,
+                batch_size=self.cfg.training.batch_size,
+                shuffle=False,
+                num_workers=self.cfg.data.num_workers,
+                pin_memory=self.cfg.data.pin_memory,
+                collate_fn=collate_fn_static,
+            )
+        return None
     
     def training_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
         """训练步骤"""
@@ -408,5 +468,28 @@ class AESystem(pl.LightningModule):
             "original": x.detach().cpu(),
             "reconstructed": x_reconstructed.detach().cpu(),
             "latent": latent.detach().cpu(),
+        }
+        
+    def test_step(self, batch: torch.Tensor, batch_idx: int) -> Dict[str, Any]:
+        """OOD 测试步骤"""
+        x = batch
+        
+        # 前向传播
+        x_reconstructed, latent = self.forward(x)
+        
+        # 计算损失和指标
+        recon_loss = self.reconstruction_loss_fn(x_reconstructed, x)
+        mse = F.mse_loss(x_reconstructed, x)
+        correlation = compute_correlation(x, x_reconstructed)
+        latent_var = latent.var(dim=0).mean()
+        
+        # 记录指标 (ood_ 前缀)
+        self.log("ood_loss", recon_loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("ood_mse", mse, on_step=False, on_epoch=True)
+        self.log("ood_correlation", correlation, on_step=False, on_epoch=True)
+        self.log("ood_latent_var", latent_var, on_step=False, on_epoch=True)
+        
+        return {
+            "ood_loss": recon_loss,
         }
 

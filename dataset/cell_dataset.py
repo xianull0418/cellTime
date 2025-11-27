@@ -228,7 +228,6 @@ class StaticCellDataset(Dataset):
         index_col: int = 0,
         verbose: bool = False,
         seed: Optional[int] = None,
-        limit_cells: Optional[int] = None,
     ):
         """
         Args:
@@ -241,7 +240,6 @@ class StaticCellDataset(Dataset):
             index_col: CSV/Excel 文件的索引列
             verbose: 是否打印信息
             seed: 随机种子
-            limit_cells: 限制使用的最大细胞数（用于快速测试）
         """
         self.use_scbank = False
         self.rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
@@ -327,11 +325,8 @@ class StaticCellDataset(Dataset):
              self.ds = self.db.main_data.data
              self.n_cells = len(self.ds)
              
-             # 限制细胞数
-             if limit_cells is not None and self.n_cells > limit_cells:
-                 if verbose:
-                     print(f"Limiting dataset from {self.n_cells} to {limit_cells} cells.")
-                 self.n_cells = limit_cells
+             self.n_cells = len(self.ds)
+
                  
              self.n_genes = len(self.db.gene_vocab)
              if verbose:
@@ -361,12 +356,8 @@ class StaticCellDataset(Dataset):
         
         self.n_cells, self.n_genes = self.adata.shape
         
-        # 限制细胞数
-        if limit_cells is not None and self.n_cells > limit_cells:
-            if verbose:
-                print(f"Limiting dataset from {self.n_cells} to {limit_cells} cells.")
-            self.n_cells = limit_cells
-            self.adata = self.adata[:self.n_cells, :]
+        self.n_cells, self.n_genes = self.adata.shape
+
         
         # 从指定的 layer 读取表达矩阵
         if layer is not None and layer in self.adata.layers:
@@ -415,6 +406,69 @@ class StaticCellDataset(Dataset):
 
         x = self.expressions[rand_idx]
         return x
+
+
+class ParquetCellDataset(Dataset):
+    """
+    Parquet 单细胞数据集 (用于 AE 训练)
+    支持从 Parquet 文件加载数据，适用于大规模数据
+    """
+    
+    def __init__(
+        self,
+        data_path: Union[str, Path],
+        *,
+        verbose: bool = False,
+        seed: Optional[int] = None,
+    ):
+        """
+        Args:
+            data_path: Parquet 文件路径
+            verbose: 是否打印信息
+            seed: 随机种子
+        """
+        self.rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
+        self.path = Path(data_path)
+        
+        if not self.path.exists():
+            raise FileNotFoundError(f"Parquet file not found: {self.path}")
+            
+        if verbose:
+            print(f"Loading Parquet dataset from: {self.path}")
+            
+        # 使用 pyarrow 读取 parquet
+        # 为了支持随机访问，我们需要将数据加载到内存
+        # 对于非常大的数据集，这可能会导致内存溢出
+        # 优化方案：使用 memory mapping 或 lazy loading (但 parquet 本身不支持高效的行级随机访问)
+        # 目前假设数据能放入内存 (或分片加载，这里简化为全量加载)
+        try:
+            df = pd.read_parquet(self.path)
+            self.expressions = torch.tensor(df.values, dtype=torch.float32)
+            self.n_cells, self.n_genes = self.expressions.shape
+            self.gene_names = df.columns.tolist()
+        except Exception as e:
+            raise RuntimeError(f"Failed to load parquet file: {e}")
+            
+        if verbose:
+            print(f"ParquetCellDataset initialized:")
+            print(f"  - Cells: {self.n_cells}")
+            print(f"  - Genes: {self.n_genes}")
+            
+    def __len__(self) -> int:
+        return self.n_cells
+    
+    def __getitem__(self, idx: int):
+        # 随机采样 (AE 训练通常不需要按顺序)
+        # 如果需要按顺序 (如验证集)，可以移除随机性
+        # 但为了保持与 StaticCellDataset 一致的接口风格 (它使用了随机采样)
+        # 我们这里也支持随机采样，或者直接返回 idx
+        # StaticCellDataset 的实现是忽略 idx 随机采样，这在 DataLoader shuffle=True 时有点奇怪
+        # 但我们遵循其模式，或者改进它。
+        # 改进：如果 DataLoader shuffle=True，idx 已经是随机的了。
+        # StaticCellDataset 的随机采样可能是为了应对 epoch 概念的模糊化？
+        # 这里我们直接返回 idx 对应的数据，让 DataLoader 控制随机性
+        
+        return self.expressions[idx]
 
 
 class TemporalCellDataset(Dataset):
