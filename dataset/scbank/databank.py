@@ -53,6 +53,15 @@ def _process_single_file(
             else:
                 adata.var[token_col] = adata.var.index.tolist()
 
+        # Preprocess data: Normalize and Log1p
+        # Standard processing for single-cell data (10k normalization + log1p)
+        try:
+            sc.pp.normalize_total(adata, target_sum=1e4)
+            sc.pp.log1p(adata)
+        except Exception as e:
+            # In case of any error (e.g. raw counts not found), we log but try to proceed if data exists
+            print(f"Warning: Preprocessing failed for {file_path.name}: {e}")
+
         tokens = adata.var[token_col].tolist()
         
         # Ind2Ind mapping

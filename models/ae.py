@@ -305,6 +305,7 @@ class AESystem(pl.LightningModule):
                 target_genes=target_genes,
                 verbose=True,
                 seed=42,
+                limit_cells=self.cfg.data.get("limit_cells", None),
             )
             
             # 更新 n_genes（如果需要）

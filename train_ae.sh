@@ -1,23 +1,27 @@
 #!/bin/bash
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=7
+
 # Autoencoder Training Script for Large-Scale Single-Cell Data
 # 
-# Usage: ./train_ae.sh [DATA_DIR] [VOCAB_FILE] [OUTPUT_DIR]
+# Usage: ./train_ae.sh [DATA_DIR] [VOCAB_FILE] [OUTPUT_DIR] [LIMIT_CELLS]
 #
 # Example:
 #   ./train_ae.sh /gpfs/hybrid/data/downloads/gcloud/arc-scbasecount/2025-02-25/h5ad/GeneFull_Ex50pAS/Homo_sapiens \
 #                 /gpfs/hybrid/data/downloads/gcloud/arc-scbasecount/2025-02-25/h5ad/GeneFull_Ex50pAS/Homo_sapiens/gene_order.tsv \
-#                 output/ae_large_scale
+#                 output/ae_large_scale_10M \
+#                 10000000
 
 DATA_DIR=${1:-"/gpfs/hybrid/data/downloads/gcloud/arc-scbasecount/2025-02-25/h5ad/GeneFull_Ex50pAS/Homo_sapiens"}
 VOCAB_FILE=${2:-"gene_order.tsv"}
-OUTPUT_DIR=${3:-"output/ae_large_scale/1125"}
+OUTPUT_DIR=${3:-"output/ae_large_scale/1125_10M"}
+LIMIT_CELLS=${4:-10000000}
 
 echo "Starting Autoencoder Training..."
 echo "Data Directory: $DATA_DIR"
 echo "Vocabulary File: $VOCAB_FILE"
 echo "Output Directory: $OUTPUT_DIR"
+echo "Limit Cells: $LIMIT_CELLS"
 
 # Ensure output directory exists
 mkdir -p "$OUTPUT_DIR"
@@ -27,6 +31,7 @@ python train_ae.py \
     --config_path="config/ae.yaml" \
     --data.data_path="$DATA_DIR" \
     --data.vocab_path="$VOCAB_FILE" \
+    --data.limit_cells="$LIMIT_CELLS" \
     --logging.output_dir="$OUTPUT_DIR" \
     --model.hidden_dim="[2048, 1024, 512]" \
     --model.latent_dim=256 \
@@ -38,4 +43,3 @@ python train_ae.py \
     --data.num_workers=16
 
 echo "Training finished."
-

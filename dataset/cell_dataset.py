@@ -209,6 +209,8 @@ def _select_highly_variable_genes(
     return adata
 
 
+import torch.distributed as dist
+
 class StaticCellDataset(Dataset):
     """
     静态单细胞数据集（用于 Autoencoder 训练）
@@ -226,6 +228,7 @@ class StaticCellDataset(Dataset):
         index_col: int = 0,
         verbose: bool = False,
         seed: Optional[int] = None,
+        limit_cells: Optional[int] = None,
     ):
         """
         Args:
@@ -238,6 +241,7 @@ class StaticCellDataset(Dataset):
             index_col: CSV/Excel 文件的索引列
             verbose: 是否打印信息
             seed: 随机种子
+            limit_cells: 限制使用的最大细胞数（用于快速测试）
         """
         self.use_scbank = False
         self.rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
@@ -270,32 +274,65 @@ class StaticCellDataset(Dataset):
                         vocab_file = path / "gene_vocab.json"
                         if not vocab_file.exists():
                             vocab_file = path / "gene_order.tsv"
-                        
+                    
+                    # DDP Synchronization Logic
+                    is_ddp = dist.is_available() and dist.is_initialized()
+                    local_rank = dist.get_rank() if is_ddp else 0
+                    
+                    # Only rank 0 checks/generates the cache
+                    if local_rank == 0:
+                        if (cache_dir / "manifest.json").exists():
+                             # Check validity
+                             try:
+                                 temp_db = DataBank.from_path(cache_dir)
+                                 if temp_db.main_table_key is None or temp_db.main_table_key not in temp_db.data_tables:
+                                     if verbose: print(f"Warning: Cached scBank is invalid. Regenerating...")
+                                     import shutil
+                                     if cache_dir.exists(): shutil.rmtree(cache_dir)
+                             except Exception:
+                                 if verbose: print(f"Warning: Cached scBank load failed. Regenerating...")
+                                 import shutil
+                                 if cache_dir.exists(): shutil.rmtree(cache_dir)
+
+                        if not (cache_dir / "manifest.json").exists():
+                             if vocab_file and vocab_file.exists():
+                                 if verbose: print(f"Converting h5ad directory to scBank cache at {cache_dir}...")
+                                 if verbose: print(f"Using gene vocabulary from: {vocab_file}")
+                                 
+                                 vocab = GeneVocab.from_file(vocab_file)
+                                 # Set num_workers to utilize high core count (e.g., 64 or more)
+                                 DataBank.from_h5ad_dir(path, vocab, to=cache_dir, num_workers=64)
+                             elif verbose:
+                                print(f"Warning: No gene vocabulary found in {path} and no vocab_path provided. "
+                                      "Cannot convert to scBank.")
+                    
+                    # All other ranks wait here
+                    if is_ddp:
+                        if verbose and local_rank != 0:
+                            print(f"[Rank {local_rank}] Waiting for data generation...")
+                        dist.barrier()
+                        if verbose and local_rank != 0:
+                            print(f"[Rank {local_rank}] Data generation check finished.")
+
+                    # Now everyone loads the valid cache
                     if (cache_dir / "manifest.json").exists():
                          if verbose: print(f"Loading from cached scBank: {cache_dir}")
                          self.use_scbank = True
                          self.db = DataBank.from_path(cache_dir)
-                         # 简单的校验：如果提供了 vocab_path，我们可以检查缓存的 vocab 大小是否匹配
-                         # 或者重新生成缓存（如果需要更严格的校验）
-                         if self.db.main_table_key is None or self.db.main_table_key not in self.db.data_tables:
-                             if verbose: print(f"Warning: Cached scBank is invalid (no main table). Regenerating...")
-                             self.use_scbank = False # Force regeneration
-                         
-                    elif vocab_file and vocab_file.exists():
-                         if verbose: print(f"Converting h5ad directory to scBank cache at {cache_dir}...")
-                         if verbose: print(f"Using gene vocabulary from: {vocab_file}")
-                         
-                         vocab = GeneVocab.from_file(vocab_file)
-                         # Set num_workers to utilize high core count (e.g., 64 or more)
-                         self.db = DataBank.from_h5ad_dir(path, vocab, to=cache_dir, num_workers=64)
-                         self.use_scbank = True
-                    elif verbose:
-                        print(f"Warning: No gene vocabulary found in {path} and no vocab_path provided. "
-                              "Cannot convert to scBank. Falling back to loading single file (if applicable) or failing.")
-        
+                    else:
+                        if verbose:
+                            print(f"Warning: scBank cache not found or generation failed.")
+
         if self.use_scbank:
              self.ds = self.db.main_data.data
              self.n_cells = len(self.ds)
+             
+             # 限制细胞数
+             if limit_cells is not None and self.n_cells > limit_cells:
+                 if verbose:
+                     print(f"Limiting dataset from {self.n_cells} to {limit_cells} cells.")
+                 self.n_cells = limit_cells
+                 
              self.n_genes = len(self.db.gene_vocab)
              if verbose:
                 print(f"StaticCellDataset (scBank) 初始化完成:")
@@ -323,6 +360,13 @@ class StaticCellDataset(Dataset):
                 self.adata = _select_highly_variable_genes(self.adata, n_top_genes=max_genes, verbose=verbose)
         
         self.n_cells, self.n_genes = self.adata.shape
+        
+        # 限制细胞数
+        if limit_cells is not None and self.n_cells > limit_cells:
+            if verbose:
+                print(f"Limiting dataset from {self.n_cells} to {limit_cells} cells.")
+            self.n_cells = limit_cells
+            self.adata = self.adata[:self.n_cells, :]
         
         # 从指定的 layer 读取表达矩阵
         if layer is not None and layer in self.adata.layers:

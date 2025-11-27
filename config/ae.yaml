@@ -23,6 +23,7 @@ training:
 data:
   data_path: null  # 数据路径，从命令行指定
   vocab_path: null # 基因词汇表路径（可选），如果提供则强制使用此词表
+  limit_cells: null # 限制参与训练的细胞总数 (null 表示使用全部)
   train_split: 0.8  # 训练集比例
   num_workers: 4  # 数据加载线程数
   pin_memory: true  # 是否固定内存
