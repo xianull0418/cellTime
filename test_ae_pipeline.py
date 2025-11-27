@@ -6,34 +6,10 @@ import numpy as np
 from pathlib import Path
 import torch
 import sys
-from unittest.mock import MagicMock
+from omegaconf import OmegaConf
 
 # Add project root to path
 sys.path.append(os.getcwd())
-
-# Mock missing dependencies
-sys.modules["omegaconf"] = MagicMock()
-sys.modules["pytorch_lightning"] = MagicMock()
-sys.modules["pytorch_lightning.callbacks"] = MagicMock()
-sys.modules["scimilarity"] = MagicMock()
-sys.modules["scimilarity.nn_models"] = MagicMock()
-# Mock datasets for scBank imports
-# We need Dataset to be a type for isinstance checks
-class MockDataset:
-    def __init__(self, *args, **kwargs): pass
-    @classmethod
-    def from_dict(cls, *args, **kwargs): return cls()
-    def to_parquet(self, *args, **kwargs): pass
-
-mock_datasets = MagicMock()
-mock_datasets.Dataset = MockDataset
-mock_datasets.load_dataset = MagicMock(return_value=MockDataset())
-sys.modules["datasets"] = mock_datasets
-
-# We need real datasets and pyarrow for scBank
-# Assuming they are installed or we mock them if strictly needed, 
-# but scBank relies heavily on them so mocking is hard.
-# We'll assume user installed pyarrow as requested.
 
 from dataset.ae_data_process import process_data
 from models.ae import AESystem
@@ -73,6 +49,17 @@ def test_pipeline():
     adata_ood = sc.AnnData(X=X_ood, obs=obs_ood, var=var_train)
     ood_h5ad = h5ad_dir / "ood_data.h5ad"
     adata_ood.write(ood_h5ad)
+    
+    # Create gene_order.tsv (optional for test, but good to have)
+    gene_order_path = Path("gene_order.tsv")
+    # Backup existing if any
+    if gene_order_path.exists():
+        shutil.copy(gene_order_path, gene_order_path.with_suffix(".bak"))
+    
+    # Write dummy gene order
+    with open(gene_order_path, "w") as f:
+        for g in var_train.index:
+            f.write(f"{g}\n")
     
     # Create CSV
     csv_data = {
@@ -114,19 +101,8 @@ def test_pipeline():
     # 3. Test Model Initialization
     print("\n[3] Testing AESystem Initialization...")
     try:
-        # Create mock config using a simple class to mimic dot access
-        class Config:
-            def __init__(self, dictionary):
-                for k, v in dictionary.items():
-                    if isinstance(v, dict):
-                        setattr(self, k, Config(v))
-                    else:
-                        setattr(self, k, v)
-            
-            def get(self, key, default=None):
-                return getattr(self, key, default)
-
-        cfg_dict = {
+        # Create config using OmegaConf
+        cfg = OmegaConf.create({
             "data": {
                 "dataset_type": "scbank",
                 "scbank_path": {
@@ -159,9 +135,7 @@ def test_pipeline():
                 "accelerator": "cpu",
                 "devices": 1
             }
-        }
-        
-        cfg = Config(cfg_dict)
+        })
         
         model = AESystem(cfg)
         model.setup(stage="fit")
@@ -182,8 +156,6 @@ def test_pipeline():
         
         # Check split ratio
         total_train = len(model.train_dataset) + len(model.val_dataset)
-        # Note: scBank processing might filter some cells, so total might not be exactly 500
-        # But split should be roughly 0.8
         ratio = len(model.train_dataset) / total_train
         print(f"Actual train ratio: {ratio:.2f}")
         
@@ -199,6 +171,11 @@ def test_pipeline():
     
     # Cleanup
     shutil.rmtree(test_dir)
+    # Restore gene_order if backed up
+    if Path("gene_order.tsv.bak").exists():
+        shutil.move("gene_order.tsv.bak", "gene_order.tsv")
+    elif Path("gene_order.tsv").exists():
+        os.remove("gene_order.tsv")
 
 if __name__ == "__main__":
     test_pipeline()

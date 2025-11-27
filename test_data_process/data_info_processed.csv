@@ -1,3 +1,0 @@
-file_path,full_validation_dataset,cell_count,cell_count_process
-test_data_process/h5ad/train_data.h5ad,0,500,500
-test_data_process/h5ad/ood_data.h5ad,1,100,100

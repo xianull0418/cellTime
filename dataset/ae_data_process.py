@@ -5,6 +5,7 @@ Process single-cell data for Autoencoder training using scBank.
 1. Read ae_data_info.csv
 2. Split into Train and OOD file lists
 3. Create scBank datasets for each
+4. Performs QC (min_genes), Gene Mapping (align to gene_order.tsv), Normalization, Log1p
 """
 
 import os
@@ -16,25 +17,101 @@ from pathlib import Path
 from tqdm import tqdm
 import warnings
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Add project root to path to allow imports
 sys.path.append(os.getcwd())
 
-from dataset.scbank.databank import DataBank, _process_single_file
+from dataset.scbank.databank import DataBank, _map_ind
 from dataset.scbank.gene_vocab import GeneVocab
 from dataset.scbank.data import MetaInfo, DataTable
 from dataset.scbank.setting import Setting
-from datasets import load_dataset
+from datasets import load_dataset, Dataset, disable_progress_bar
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
+
+def process_single_file_custom(
+    file_path: Path, 
+    to_path: Path, 
+    vocab: GeneVocab, 
+    main_table_key: str, 
+    index: int,
+    min_genes: int = 200
+):
+    """
+    Custom worker to process a single h5ad file.
+    Performs: QC -> Gene Mapping -> Norm -> Log1p -> Tokenize -> Save Parquet
+    """
+    disable_progress_bar()
+    
+    try:
+        # 1. Read Data
+        adata = sc.read_h5ad(file_path)
+        
+        # 2. QC: Filter cells
+        if min_genes > 0:
+            sc.pp.filter_cells(adata, min_genes=min_genes)
+            if adata.n_obs == 0:
+                print(f"Warning: {file_path.name} has 0 cells after QC.")
+                return None
+
+        # 3. Gene Mapping Setup
+        # We need to map adata.var_names to vocab indices
+        # scBank's _map_ind does this: maps existing token -> new index
+        # Extra genes in adata are ignored (not in vocab -> not in ind2ind)
+        # Missing genes in adata are just not present in the sparse output (implicitly 0)
+        
+        # Ensure we use the correct column for gene names (usually index)
+        tokens = adata.var_names.tolist()
+        ind2ind = _map_ind(tokens, vocab)
+        
+        # 4. Normalization & Log1p
+        try:
+            sc.pp.normalize_total(adata, target_sum=1e4)
+            sc.pp.log1p(adata)
+        except Exception as e:
+            print(f"Warning: Preprocessing failed for {file_path.name}: {e}")
+
+        # 5. Tokenize
+        # Use a dummy DataBank to access _tokenize method
+        # We use a dummy DataBank to reuse the robust tokenization logic (handling sparse/dense/numba)
+        db_dummy = DataBank(meta_info=MetaInfo(), gene_vocab=vocab)
+        
+        data_key = main_table_key
+        if data_key == "X":
+            data = adata.X
+        elif data_key in adata.layers:
+            data = adata.layers[data_key]
+        else:
+            data = adata.X
+
+        tokenized_data = db_dummy._tokenize(data, ind2ind)
+        
+        # 6. Save to Parquet
+        ds = Dataset.from_dict(tokenized_data)
+        shard_path = to_path / f"shard_{index}.parquet"
+        ds.to_parquet(shard_path)
+        
+        # Clean up
+        del adata
+        del data
+        del tokenized_data
+        del ds
+        
+        return str(shard_path)
+
+    except Exception as e:
+        print(f"Failed to process {file_path}: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 def create_scbank_from_files(
     files: list,
     output_dir: Path,
     vocab: GeneVocab = None,
     main_table_key: str = "X",
-    token_col: str = "gene_name",
     num_workers: int = 4,
     min_genes: int = 200,
 ):
@@ -43,17 +120,23 @@ def create_scbank_from_files(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # If vocab is not provided, build it from the first file (assuming consistency)
+    # Load vocab from gene_order.tsv if not provided
     if vocab is None:
-        print("Building vocabulary from the first file...")
-        first_adata = sc.read_h5ad(files[0])
-        genes = first_adata.var_names.tolist()
-        vocab = GeneVocab.from_dict({g: i for i, g in enumerate(genes)})
-        # Save vocab
-        vocab.save_json(output_dir / "gene_vocab.json")
-        del first_adata
+        gene_order_path = Path("gene_order.tsv")
+        if gene_order_path.exists():
+            print(f"Loading vocabulary from {gene_order_path}...")
+            vocab = GeneVocab.from_file(gene_order_path)
+        else:
+            print("Warning: gene_order.tsv not found. Building vocabulary from the first file...")
+            first_adata = sc.read_h5ad(files[0])
+            genes = first_adata.var_names.tolist()
+            vocab = GeneVocab.from_dict({g: i for i, g in enumerate(genes)})
+            del first_adata
+            
+    # Save vocab to scBank
+    vocab.save_json(output_dir / "gene_vocab.json")
 
-    # Initialize DataBank
+    # Initialize DataBank (MetaInfo only)
     db = DataBank(
         meta_info=MetaInfo(on_disk_path=output_dir, on_disk_format="parquet"),
         gene_vocab=vocab,
@@ -63,24 +146,17 @@ def create_scbank_from_files(
     # Process files
     parquet_files = []
     
-    # We can reuse _process_single_file from databank.py
-    # But we need to handle the multiprocessing ourselves or use the one in databank if adaptable
-    # Since _process_single_file is module-level, we can use it.
-    # However, _process_single_file in databank.py does normalization/log1p internally.
-    # We need to ensure it matches our requirements.
-    # Checking databank.py:
-    # It does: sc.pp.normalize_total(adata, target_sum=1e4) -> sc.pp.log1p(adata)
-    # This matches our requirement.
-    
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    
-    print(f"Processing {len(files)} files to {output_dir}...")
+    print(f"Processing {len(files)} files to {output_dir} with {num_workers} workers...")
+    print(f"  - QC: min_genes={min_genes}")
+    print(f"  - Gene Mapping: Aligned to {len(vocab)} genes")
+    print(f"  - Norm: 1e4")
+    print(f"  - Log1p: Yes")
     
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         future_to_file = {
             executor.submit(
-                _process_single_file, 
-                Path(f), output_dir, vocab, main_table_key, token_col, i
+                process_single_file_custom, 
+                Path(f), output_dir, vocab, main_table_key, i, min_genes
             ): f for i, f in enumerate(files)
         }
         
@@ -100,12 +176,6 @@ def create_scbank_from_files(
     # Load all parquet files as a single Dataset
     print(f"Loading {len(parquet_files)} shards as a single dataset...")
     try:
-        # Note: load_dataset might fail if datasets library is mocked improperly or version mismatch
-        # For verification script with mocks, this step is fragile.
-        # But in real run, it should work.
-        # The error "isinstance() arg 2 must be a type" suggests some type check failed.
-        # It might be in scBank's update_datatables where it checks isinstance(t, DataTable)
-        
         full_ds = load_dataset("parquet", data_files=parquet_files, split="train", cache_dir=str(output_dir))
         
         data_table = DataTable(
@@ -164,7 +234,7 @@ def process_data(
     # Create OOD scBank
     if ood_files:
         print("\n=== Creating OOD scBank ===")
-        # Use the same vocab as train if available
+        # Use the same vocab as train if available (which should be gene_order.tsv)
         vocab = None
         if (train_dir / "gene_vocab.json").exists():
             vocab = GeneVocab.from_file(train_dir / "gene_vocab.json")
@@ -176,9 +246,6 @@ def process_data(
             num_workers=num_workers,
             min_genes=min_genes
         )
-        
-    # Update CSV with processed info (optional, scBank doesn't strictly need this but good for record)
-    # For now we skip updating cell counts per file as scBank aggregates them.
     
     print("\nProcessing Complete!")
 
