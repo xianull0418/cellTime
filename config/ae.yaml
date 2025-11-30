@@ -22,8 +22,8 @@ training:
 data:
   dataset_type: parquet
   
-  # Paths to preprocessed parquet files (or directories of shards)
-  parquet_path:
+  # Paths to processed data (Zarr or Parquet shards)
+  processed_path:
     train: data/ae_processed/train_shards
     val: data/ae_processed/val_shards
     test: data/ae_processed/test_shards
@@ -35,7 +35,7 @@ data:
 logging:
   output_dir: output/ae
   log_every_n_steps: 50
-  val_check_interval: 0.5
+  val_check_interval: 2000 # Check validation every 2000 batches (approx 10% of epoch if ~20k batches)
   log_embeddings_every_n_epochs: 10
 
 accelerator:

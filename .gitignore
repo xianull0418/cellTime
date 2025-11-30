@@ -8,7 +8,7 @@
 /tests
 /LICENSE
 *output
-
+pym*
 
 dataset/__pycache__
 __pycache__/

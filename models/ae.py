@@ -14,7 +14,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from scimilarity.nn_models import Encoder, Decoder
 from models.utils import compute_correlation
-from dataset import ParquetDataset, ParquetIterableDataset, collate_fn_static
+from dataset import ParquetDataset, ParquetIterableDataset, ZarrIterableDataset, collate_fn_static
 
 class Autoencoder(nn.Module):
     """
@@ -134,20 +134,46 @@ class AESystem(pl.LightningModule):
     def setup(self, stage: Optional[str] = None):
         """
         Setup datasets.
-        Now supports 'parquet' type natively.
+        Now supports 'parquet' and 'zarr' type natively.
         """
         if stage == "fit" or stage is None:
             dataset_type = self.cfg.data.get("dataset_type", "parquet")
+            # Renamed from parquet_path to processed_path for generality
+            p_cfg = self.cfg.data.get("processed_path", self.cfg.data.get("parquet_path", None))
             
-            if dataset_type == "parquet":
-                print("Setting up Parquet datasets...")
-                p_cfg = self.cfg.data.get("parquet_path", None)
-                if not p_cfg:
-                     raise ValueError("dataset_type='parquet' but data.parquet_path is missing in config.")
+            if not p_cfg:
+                 raise ValueError(f"dataset_type='{dataset_type}' but data.processed_path is missing in config.")
 
-                train_path = Path(p_cfg.train)
-                val_path = Path(p_cfg.val)
-                ood_path = Path(p_cfg.ood)
+            train_path = Path(p_cfg.train)
+            val_path = Path(p_cfg.val)
+            ood_path = Path(p_cfg.ood)
+            
+            if dataset_type == "zarr":
+                print("Setting up Zarr datasets...")
+                
+                # Train
+                if train_path.exists():
+                    print(f"Loading Training Data from {train_path} (Zarr Iterable Mode)...")
+                    self.train_dataset = ZarrIterableDataset(train_path, verbose=True, shuffle_shards=True, shuffle_rows=True)
+                    
+                    if self.cfg.model.n_genes != self.train_dataset.n_genes:
+                        print(f"Auto-updating n_genes: {self.cfg.model.n_genes} -> {self.train_dataset.n_genes}")
+                        self.cfg.model.n_genes = self.train_dataset.n_genes
+                else:
+                    raise FileNotFoundError(f"Train data not found: {train_path}")
+                
+                # Val
+                if val_path.exists():
+                    self.val_dataset = ZarrIterableDataset(val_path, verbose=True, shuffle_shards=False, shuffle_rows=False)
+                else:
+                    print(f"Warning: Val data not found: {val_path}")
+                    
+                # OOD
+                if ood_path.exists():
+                    self.ood_dataset = ZarrIterableDataset(ood_path, verbose=True, shuffle_shards=False, shuffle_rows=False)
+
+            elif dataset_type == "parquet":
+                print("Setting up Parquet datasets...")
                 
                 # Train
                 if train_path.exists():
@@ -174,9 +200,9 @@ class AESystem(pl.LightningModule):
                     self.ood_dataset = ParquetIterableDataset(ood_path, verbose=True, shuffle_shards=False, shuffle_rows=False)
             
             else:
-                # Legacy support if needed, but defaulting to Parquet as per request
+                # Legacy support if needed
                 print(f"Warning: Unknown dataset_type '{dataset_type}', falling back to manual setup or error.")
-    
+
         # Re-initialize autoencoder if n_genes changed during setup
         if self.autoencoder.n_genes != self.cfg.model.n_genes:
             print(f"Re-initializing Autoencoder with n_genes={self.cfg.model.n_genes}")
@@ -190,7 +216,7 @@ class AESystem(pl.LightningModule):
             # IMPORTANT: Sync reconstruction_loss_fn with model device
             if hasattr(self, 'reconstruction_loss_fn'):
                 self.reconstruction_loss_fn = self.reconstruction_loss_fn.to(self.device)
-
+    
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
@@ -202,7 +228,20 @@ class AESystem(pl.LightningModule):
         )
     
     def val_dataloader(self):
-        if not self.val_dataset: return None
+        if not self.val_dataset: 
+            # Return an empty list or None is tricky in PL
+            # Better to return a dummy dataloader or handle this case
+            # If we return None, PL complains.
+            # Let's try returning an empty DataLoader if dataset is missing, but ideally we should have val data.
+            # If truly no val data, maybe we should skip val? 
+            # For now, let's assume if it's None, we return an empty list which acts as an empty iterator?
+            # Actually, the error says "TypeError: 'NoneType' object is not iterable" which implies PL tried to iterate over None.
+            # Correct fix: if no val dataset, don't return None if PL expects it. 
+            # However, PL supports None for val_dataloader IF limit_val_batches=0. 
+            
+            # Let's just return a dummy empty list which is iterable, although PL might expect DataLoader.
+            # Safer: create a dummy dataset.
+            return [] 
         return DataLoader(
             self.val_dataset,
             batch_size=self.cfg.training.batch_size,
@@ -214,7 +253,7 @@ class AESystem(pl.LightningModule):
     
     def test_dataloader(self):
         """OOD Validation"""
-        if not self.ood_dataset: return None
+        if not self.ood_dataset: return []
         return DataLoader(
             self.ood_dataset,
             batch_size=self.cfg.training.batch_size,

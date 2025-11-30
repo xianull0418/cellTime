@@ -12,6 +12,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 import uuid
 import shutil
+try:
+    import zarr
+    import numcodecs
+except ImportError:
+    zarr = None
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -41,9 +46,9 @@ def load_gene_vocab(vocab_path):
 
 def process_and_write_task(args):
     """
-    Worker task to process a single h5ad file and write directly to a temporary parquet file.
+    Worker task to process a single h5ad file and write directly to a temporary Zarr or Parquet file.
     """
-    file_path, is_ood, min_genes, target_sum, temp_dir = args
+    file_path, is_ood, min_genes, target_sum, temp_dir, output_format = args
     
     global shared_target_genes
     if shared_target_genes is None:
@@ -52,7 +57,16 @@ def process_and_write_task(args):
     try:
         # Read h5ad
         adata = sc.read_h5ad(file_path)
-        adata.var_names_make_unique()
+        
+        # Fix gene matching: Map Ensembl IDs (index) to Gene Symbols (gene_symbols column)
+        if "gene_symbols" in adata.var.columns:
+            # Check overlap with vocab using symbols
+            # We want to index adata by symbols to match our vocab
+            adata.var_names = adata.var["gene_symbols"].astype(str)
+            adata.var_names_make_unique()
+        else:
+            # Fallback or already correct
+            adata.var_names_make_unique()
         
         # 1. Filter cells
         if min_genes > 0:
@@ -93,12 +107,35 @@ def process_and_write_task(args):
         stats = {'train': 0, 'val': 0, 'test': 0, 'ood': 0}
         created_files = {}
 
+        def write_shard(df_shard, prefix):
+            if len(df_shard) == 0: return
+            
+            if output_format == "zarr":
+                fname = temp_dir / f"{prefix}_{unique_id}.zarr"
+                # Create Zarr group and dataset
+                store = zarr.DirectoryStore(str(fname))
+                root = zarr.group(store=store, overwrite=True)
+                
+                # Standardize on "X" for data
+                # Chunks: (chunk_size, n_genes). Default auto chunking is often fine, but let's be explicit
+                # Given typical shard size ~6000 rows, maybe 1 chunk or a few.
+                root.create_dataset("X", data=df_shard.values, chunks=(None, None), dtype="float32")
+                
+                # Optionally save obs/var for compatibility (simplified)
+                # root.create_dataset("obs", data=df_shard.index.values.astype(str))
+                # root.create_dataset("var", data=df_shard.columns.values.astype(str))
+                
+                created_files[prefix] = str(fname)
+                stats[prefix] += len(df_shard)
+                
+            else: # parquet
+                fname = temp_dir / f"{prefix}_{unique_id}.parquet"
+                pq.write_table(pa.Table.from_pandas(df_shard), fname, compression='snappy')
+                created_files[prefix] = str(fname)
+                stats[prefix] += len(df_shard)
+
         if is_ood:
-            fname = temp_dir / f"ood_{unique_id}.parquet"
-            table = pa.Table.from_pandas(df_aligned)
-            pq.write_table(table, fname, compression='snappy')
-            stats['ood'] += len(df_aligned)
-            created_files['ood'] = str(fname)
+            write_shard(df_aligned, 'ood')
         else:
             n_cells = len(df_aligned)
             indices = np.random.permutation(n_cells)
@@ -110,26 +147,9 @@ def process_and_write_task(args):
             val_idx = indices[n_train:n_train+n_val]
             test_idx = indices[n_train+n_val:]
             
-            if len(train_idx) > 0:
-                fname = temp_dir / f"train_{unique_id}.parquet"
-                t_df = df_aligned.iloc[train_idx]
-                pq.write_table(pa.Table.from_pandas(t_df), fname, compression='snappy')
-                stats['train'] += len(t_df)
-                created_files['train'] = str(fname)
-                
-            if len(val_idx) > 0:
-                fname = temp_dir / f"val_{unique_id}.parquet"
-                v_df = df_aligned.iloc[val_idx]
-                pq.write_table(pa.Table.from_pandas(v_df), fname, compression='snappy')
-                stats['val'] += len(v_df)
-                created_files['val'] = str(fname)
-                
-            if len(test_idx) > 0:
-                fname = temp_dir / f"test_{unique_id}.parquet"
-                test_df = df_aligned.iloc[test_idx]
-                pq.write_table(pa.Table.from_pandas(test_df), fname, compression='snappy')
-                stats['test'] += len(test_df)
-                created_files['test'] = str(fname)
+            if len(train_idx) > 0: write_shard(df_aligned.iloc[train_idx], 'train')
+            if len(val_idx) > 0: write_shard(df_aligned.iloc[val_idx], 'val')
+            if len(test_idx) > 0: write_shard(df_aligned.iloc[test_idx], 'test')
 
         return stats, created_files
 
@@ -140,15 +160,22 @@ def main():
     parser = argparse.ArgumentParser(description="Preprocess single-cell data for Autoencoder (Parallel I/O Sharded)")
     parser.add_argument("--csv_path", type=str, default="data_info/ae_data_info.csv", help="Path to data info CSV")
     parser.add_argument("--vocab_path", type=str, default="data_info/gene_order.tsv", help="Path to gene vocabulary")
-    parser.add_argument("--output_dir", type=str, default="data/ae_processed", help="Output directory for parquet files")
+    parser.add_argument("--output_dir", type=str, default="data/ae_processed", help="Output directory for processed files")
     parser.add_argument("--min_genes", type=int, default=200, help="Minimum genes per cell")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of worker processes")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--format", type=str, default="zarr", choices=["parquet", "zarr"], help="Output format")
     
     args = parser.parse_args()
     
+    if args.format == "zarr" and zarr is None:
+        raise ImportError("Please install zarr and numcodecs to use zarr format.")
+    
     np.random.seed(args.seed)
     output_dir = Path(args.output_dir)
+    # Append format to output dir to avoid conflicts if needed, or just assume user handles it
+    # output_dir = output_dir / args.format 
+    
     temp_dir = output_dir / "temp_chunks"
     
     # Cleanup and create dirs
@@ -175,9 +202,9 @@ def main():
         is_ood = row.get('full_validation_dataset', 0) == 1
         
         if Path(file_path).exists():
-            tasks.append((file_path, is_ood, args.min_genes, 1e4, temp_dir))
+            tasks.append((file_path, is_ood, args.min_genes, 1e4, temp_dir, args.format))
     
-    logger.info(f"Starting processing with {args.num_workers} workers (Sharded Output Mode)...")
+    logger.info(f"Starting processing with {args.num_workers} workers (Output: {args.format})...")
     
     # Output directories for shards
     shard_dirs = {
@@ -206,7 +233,12 @@ def main():
                 for key, temp_path in created_files.items():
                     temp_path = Path(temp_path)
                     final_path = shard_dirs[key] / temp_path.name
-                    shutil.move(str(temp_path), str(final_path))
+                    # For zarr directory, we need to move the whole directory
+                    if temp_path.is_dir():
+                        if final_path.exists(): shutil.rmtree(final_path)
+                        shutil.move(str(temp_path), str(final_path))
+                    else:
+                        shutil.move(str(temp_path), str(final_path))
 
     logger.info(f"Processing statistics: {total_stats}")
     

@@ -25,25 +25,26 @@ PROCESSED_DIR="${DATA_DIR}/.parquet"
 # echo "Processed Data: $PROCESSED_DIR"
 # echo "=================================================="
 
-# # Ensure directories exist
-# mkdir -p "$OUTPUT_DIR"
-# mkdir -p "$PROCESSED_DIR"
+# Ensure directories exist
+mkdir -p "$OUTPUT_DIR"
+mkdir -p "$PROCESSED_DIR"
 
-# # Step 1: Preprocessing
-# echo "[Step 1] Preprocessing Data..."
-# # Check if data is already processed (check for train shards directory)
-# if [ ! -d "$PROCESSED_DIR/train_shards" ]; then
-#     # Added --num_workers optimization
-#     python preprocess_ae.py \
-#         --csv_path "$CSV_INFO" \
-#         --vocab_path "$VOCAB_FILE" \
-#         --output_dir "$PROCESSED_DIR" \
-#         --min_genes 200 \
-#         --num_workers 64
-# else
-#     echo "Processed shards found in $PROCESSED_DIR/train_shards. Skipping preprocessing."
-#     echo "Remove directories to force re-processing."
-# fi
+# Step 1: Preprocessing
+echo "[Step 1] Preprocessing Data..."
+# Check if data is already processed (check for train shards directory)
+if [ ! -d "$PROCESSED_DIR/train_shards" ]; then
+    # Added --num_workers optimization
+    python preprocess_ae.py \
+        --csv_path "$CSV_INFO" \
+        --vocab_path "$VOCAB_FILE" \
+        --output_dir "$PROCESSED_DIR" \
+        --min_genes 200 \
+        --num_workers 64 \
+        --format "parquet"
+else
+    echo "Processed shards found in $PROCESSED_DIR/train_shards. Skipping preprocessing."
+    echo "Remove directories to force re-processing."
+fi
 
 # Step 2: Training
 echo "[Step 2] Training Autoencoder..."
@@ -52,10 +53,10 @@ echo "[Step 2] Training Autoencoder..."
 python train_ae.py \
     --config_path="config/ae.yaml" \
     --data.dataset_type="parquet" \
-    --data.parquet_path.train="$PROCESSED_DIR/train_shards" \
-    --data.parquet_path.val="$PROCESSED_DIR/val_shards" \
-    --data.parquet_path.test="$PROCESSED_DIR/test_shards" \
-    --data.parquet_path.ood="$PROCESSED_DIR/ood_shards" \
+    --data.processed_path.train="$PROCESSED_DIR/train_shards" \
+    --data.processed_path.val="$PROCESSED_DIR/val_shards" \
+    --data.processed_path.test="$PROCESSED_DIR/test_shards" \
+    --data.processed_path.ood="$PROCESSED_DIR/ood_shards" \
     --logging.output_dir="$OUTPUT_DIR" \
     --model.hidden_dim="[2048, 1024, 512]" \
     --model.latent_dim=256 \

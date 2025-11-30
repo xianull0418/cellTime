@@ -17,6 +17,11 @@ from tqdm import tqdm
 import math
 
 try:
+    import zarr
+except ImportError:
+    zarr = None
+
+try:
     import anndata as ad
 except ImportError:
     ad = None
@@ -303,17 +308,34 @@ class ParquetIterableDataset(IterableDataset):
             raise RuntimeError(f"Failed to initialize ParquetIterableDataset: {e}")
 
     def __iter__(self):
+        import torch.distributed as dist
+        
+        # 1. Global Split (per Rank/GPU)
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+            
+        # Split files among ranks
+        per_rank = int(math.ceil(len(self.files) / float(world_size)))
+        rank_start = rank * per_rank
+        rank_end = min(rank_start + per_rank, len(self.files))
+        my_files = self.files[rank_start:rank_end]
+
+        # 2. Local Split (per Worker)
         worker_info = torch.utils.data.get_worker_info()
         
         if worker_info is None:  # Single-process data loading
-            my_files = list(self.files)
+            pass # my_files is already set
         else:  # Worker split
             # Split files among workers
-            per_worker = int(math.ceil(len(self.files) / float(worker_info.num_workers)))
+            per_worker = int(math.ceil(len(my_files) / float(worker_info.num_workers)))
             worker_id = worker_info.id
             iter_start = worker_id * per_worker
-            iter_end = min(iter_start + per_worker, len(self.files))
-            my_files = self.files[iter_start:iter_end]
+            iter_end = min(iter_start + per_worker, len(my_files))
+            my_files = my_files[iter_start:iter_end]
             
         if self.shuffle_shards:
             np.random.shuffle(my_files)
@@ -354,9 +376,159 @@ class ParquetIterableDataset(IterableDataset):
                 print(f"Error reading shard {fpath}: {e}")
                 continue
 
-    def __len__(self):
-        # Return estimated length if known, else warning
-        return self.n_cells
+    # Removed __len__ to avoid PyTorch Lightning stopping early if n_cells is 0
+    # def __len__(self):
+    #    return self.n_cells
+
+
+class ZarrIterableDataset(IterableDataset):
+    """
+    Iterative Dataset for efficient training on large Zarr datasets (sharded or consolidated).
+    Reads chunks efficiently.
+    """
+    def __init__(self, path: Union[str, Path], verbose: bool = False, shuffle_shards: bool = True, shuffle_rows: bool = True):
+        self.path = Path(path)
+        self.verbose = verbose
+        self.shuffle_shards = shuffle_shards
+        self.shuffle_rows = shuffle_rows
+        
+        if zarr is None:
+            raise ImportError("Please install zarr: pip install zarr")
+
+        self.files = []
+        if self.path.is_dir():
+            # Look for .zarr directories
+            self.files = sorted(list(self.path.glob("*.zarr")))
+            if not self.files:
+                # Fallback: maybe the directory IS the zarr store?
+                if (self.path / ".zgroup").exists():
+                    self.files = [self.path]
+                else:
+                    raise FileNotFoundError(f"No .zarr files found in directory: {self.path}")
+            if verbose:
+                print(f"Loading Zarr iterable dataset: {self.path} ({len(self.files)} shards)")
+        elif str(self.path).endswith(".zarr"): # Treat as single zarr
+             self.files = [self.path]
+        else:
+             raise FileNotFoundError(f"Path not found: {self.path}")
+
+        # Metadata read from first file
+        try:
+            store = zarr.open_group(str(self.files[0]), mode='r')
+            # Auto-detect X structure
+            if "X" in store:
+                if isinstance(store["X"], zarr.hierarchy.Group):
+                    # X/data pattern (csc/csr)
+                    if "data" in store["X"]:
+                        # Estimate n_genes from shape attribute
+                        self.n_genes = store["X"].attrs["shape"][1]
+                    else:
+                        # Fallback if no standard sparse structure
+                        raise ValueError("Zarr X group exists but structure unknown (no 'data')")
+                else:
+                    # X is a direct array (dense)
+                    self.n_genes = store["X"].shape[1]
+            else:
+                # Try to find array directly if not in group 'X' (unlikely for anndata structure)
+                # Assuming structure is root -> X
+                raise ValueError("Zarr store must contain 'X' array/group")
+            
+            self.n_cells = 0 # Unknown unless scanned
+            
+            # Cache check
+            cache_file = self.path / "metadata_cache_zarr.json" if self.path.is_dir() else None
+            if cache_file and cache_file.exists():
+                try:
+                    with open(cache_file, 'r') as f:
+                        cache = json.load(f)
+                    if cache.get('n_files') == len(self.files):
+                        self.n_cells = cache['n_cells']
+                except: pass
+                
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize ZarrIterableDataset: {e}")
+
+    def __iter__(self):
+        # DDP and Worker splitting
+        import torch.distributed as dist
+        
+        # 1. Global Split (per Rank/GPU)
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+            
+        # Split files among ranks
+        per_rank = int(math.ceil(len(self.files) / float(world_size)))
+        rank_start = rank * per_rank
+        rank_end = min(rank_start + per_rank, len(self.files))
+        my_files = self.files[rank_start:rank_end]
+
+        # 2. Local Split (per Worker)
+        worker_info = torch.utils.data.get_worker_info()
+        
+        if worker_info is not None:
+            per_worker = int(math.ceil(len(my_files) / float(worker_info.num_workers)))
+            worker_id = worker_info.id
+            iter_start = worker_id * per_worker
+            iter_end = min(iter_start + per_worker, len(my_files))
+            my_files = my_files[iter_start:iter_end]
+            
+        if self.shuffle_shards:
+            np.random.shuffle(my_files)
+            
+        if self.verbose:
+            # Only print for first worker on first rank to avoid clutter
+            if (worker_info is None or worker_info.id == 0) and rank == 0:
+                print(f"Rank {rank} Worker {0 if worker_info is None else worker_info.id} starting with {len(my_files)} files.")
+
+        for fpath in my_files:
+            try:
+                store = zarr.open_group(str(fpath), mode='r')
+                # Assume X is the data
+                X = store["X"]
+                
+                # We can read the whole X if shard is small, or chunk by chunk
+                # For simplicity and speed (given shards are small ~6k rows), read full X
+                
+                # Handle Sparse Zarr (as saved by scimilarity/anndata)
+                if isinstance(X, zarr.hierarchy.Group) and "data" in X and "indices" in X and "indptr" in X:
+                    from scipy.sparse import csr_matrix
+                    data = X["data"][:]
+                    indices = X["indices"][:]
+                    indptr = X["indptr"][:]
+                    shape = X.attrs["shape"]
+                    # Reconstruct CSR
+                    mat = csr_matrix((data, indices, indptr), shape=shape)
+                    data = mat.toarray()
+                else:
+                    # Dense Zarr
+                    # Converting to numpy array loads into memory
+                    data = X[:] 
+                
+                if hasattr(data, "toarray"): # Handle sparse if stored as sparse object (unlikely with standard zarr without wrapper)
+                    data = data.toarray()
+                
+                data = data.astype(np.float32, copy=False)
+                
+                n_rows = len(data)
+                indices = np.arange(n_rows)
+                
+                if self.shuffle_rows:
+                    np.random.shuffle(indices)
+                
+                for idx in indices:
+                    yield torch.from_numpy(data[idx])
+                    
+            except Exception as e:
+                print(f"Error reading zarr shard {fpath}: {e}")
+                continue
+
+    # Removed __len__ to avoid PyTorch Lightning stopping early if n_cells is 0 (uncached)
+    # def __len__(self):
+    #    return self.n_cells
 
 
 # Alias for backward compatibility if needed, or use ParquetDataset directly
