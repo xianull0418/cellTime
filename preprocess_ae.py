@@ -10,6 +10,8 @@ from tqdm import tqdm
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
+import uuid
+import shutil
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -37,20 +39,15 @@ def load_gene_vocab(vocab_path):
     
     return genes
 
-def process_single_h5ad_task(args):
+def process_and_write_task(args):
     """
-    Worker task to process a single h5ad file.
-    Args:
-        args: tuple (file_path, is_ood, min_genes, target_sum)
-    Returns:
-        tuple: (df_aligned, is_ood, file_path) or (None, is_ood, file_path)
+    Worker task to process a single h5ad file and write directly to a temporary parquet file.
     """
-    file_path, is_ood, min_genes, target_sum = args
+    file_path, is_ood, min_genes, target_sum, temp_dir = args
     
-    # Access shared variable
     global shared_target_genes
     if shared_target_genes is None:
-        return None, is_ood, file_path
+        return None
 
     try:
         # Read h5ad
@@ -62,7 +59,7 @@ def process_single_h5ad_task(args):
             sc.pp.filter_cells(adata, min_genes=min_genes)
         
         if adata.shape[0] == 0:
-            return None, is_ood, file_path
+            return None
 
         # 2. Normalize
         sc.pp.normalize_total(adata, target_sum=target_sum)
@@ -71,44 +68,78 @@ def process_single_h5ad_task(args):
         sc.pp.log1p(adata)
 
         # 4. Align genes
-        # Use sparse to dense strategy to manage memory if needed
-        # For now, assuming dense fits in worker memory
         if hasattr(adata.X, 'toarray'):
             data = adata.X.toarray()
         else:
             data = adata.X
             
-        # Create DataFrame
         df = pd.DataFrame(
             data, 
             index=adata.obs_names, 
             columns=adata.var_names
         )
         
-        # Optimize memory: convert to float32 immediately
         df = df.astype(np.float32)
 
-        # Reindex to target genes (filling missing with 0)
-        # copy=False to avoid extra copy if possible
+        # Reindex
         df_aligned = df.reindex(columns=shared_target_genes, fill_value=0.0)
-        
-        # Ensure float32 again (reindex with 0.0 might introduce float64)
         df_aligned = df_aligned.astype(np.float32, copy=False)
         
-        # Handle NaNs if any
         if df_aligned.isna().values.any():
              df_aligned = df_aligned.fillna(0.0)
+        
+        # Write to temp files
+        unique_id = str(uuid.uuid4())
+        stats = {'train': 0, 'val': 0, 'test': 0, 'ood': 0}
+        created_files = {}
 
-        return df_aligned, is_ood, file_path
+        if is_ood:
+            fname = temp_dir / f"ood_{unique_id}.parquet"
+            table = pa.Table.from_pandas(df_aligned)
+            pq.write_table(table, fname, compression='snappy')
+            stats['ood'] += len(df_aligned)
+            created_files['ood'] = str(fname)
+        else:
+            n_cells = len(df_aligned)
+            indices = np.random.permutation(n_cells)
+            
+            n_train = int(n_cells * 0.90)
+            n_val = int(n_cells * 0.05)
+            
+            train_idx = indices[:n_train]
+            val_idx = indices[n_train:n_train+n_val]
+            test_idx = indices[n_train+n_val:]
+            
+            if len(train_idx) > 0:
+                fname = temp_dir / f"train_{unique_id}.parquet"
+                t_df = df_aligned.iloc[train_idx]
+                pq.write_table(pa.Table.from_pandas(t_df), fname, compression='snappy')
+                stats['train'] += len(t_df)
+                created_files['train'] = str(fname)
+                
+            if len(val_idx) > 0:
+                fname = temp_dir / f"val_{unique_id}.parquet"
+                v_df = df_aligned.iloc[val_idx]
+                pq.write_table(pa.Table.from_pandas(v_df), fname, compression='snappy')
+                stats['val'] += len(v_df)
+                created_files['val'] = str(fname)
+                
+            if len(test_idx) > 0:
+                fname = temp_dir / f"test_{unique_id}.parquet"
+                test_df = df_aligned.iloc[test_idx]
+                pq.write_table(pa.Table.from_pandas(test_df), fname, compression='snappy')
+                stats['test'] += len(test_df)
+                created_files['test'] = str(fname)
+
+        return stats, created_files
 
     except Exception as e:
-        print(f"Error processing {file_path}: {e}")
-        return None, is_ood, file_path
+        return None
 
 def main():
-    parser = argparse.ArgumentParser(description="Preprocess single-cell data for Autoencoder (Parallel)")
-    parser.add_argument("--csv_path", type=str, default="ae_data_info.csv", help="Path to data info CSV")
-    parser.add_argument("--vocab_path", type=str, default="gene_order.tsv", help="Path to gene vocabulary")
+    parser = argparse.ArgumentParser(description="Preprocess single-cell data for Autoencoder (Parallel I/O Sharded)")
+    parser.add_argument("--csv_path", type=str, default="data_info/ae_data_info.csv", help="Path to data info CSV")
+    parser.add_argument("--vocab_path", type=str, default="data_info/gene_order.tsv", help="Path to gene vocabulary")
     parser.add_argument("--output_dir", type=str, default="data/ae_processed", help="Output directory for parquet files")
     parser.add_argument("--min_genes", type=int, default=200, help="Minimum genes per cell")
     parser.add_argument("--num_workers", type=int, default=8, help="Number of worker processes")
@@ -118,6 +149,12 @@ def main():
     
     np.random.seed(args.seed)
     output_dir = Path(args.output_dir)
+    temp_dir = output_dir / "temp_chunks"
+    
+    # Cleanup and create dirs
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Load vocabulary
@@ -131,22 +168,6 @@ def main():
     info_df = pd.read_csv(args.csv_path)
     logger.info(f"Found {len(info_df)} files in CSV")
     
-    # Writers cache
-    writers = {}
-    
-    def get_writer(split_name, schema):
-        if split_name not in writers:
-            outfile = output_dir / f"{split_name}.parquet"
-            writers[split_name] = pq.ParquetWriter(
-                outfile,
-                schema=schema,
-                compression='snappy'
-            )
-        return writers[split_name]
-
-    # Stats
-    stats = {k: 0 for k in ['train', 'val', 'test', 'ood']}
-
     # Prepare tasks
     tasks = []
     for idx, row in info_df.iterrows():
@@ -154,69 +175,48 @@ def main():
         is_ood = row.get('full_validation_dataset', 0) == 1
         
         if Path(file_path).exists():
-            tasks.append((file_path, is_ood, args.min_genes, 1e4))
+            tasks.append((file_path, is_ood, args.min_genes, 1e4, temp_dir))
     
-    logger.info(f"Starting processing with {args.num_workers} workers...")
+    logger.info(f"Starting processing with {args.num_workers} workers (Sharded Output Mode)...")
+    
+    # Output directories for shards
+    shard_dirs = {
+        'train': output_dir / "train_shards",
+        'val': output_dir / "val_shards",
+        'test': output_dir / "test_shards",
+        'ood': output_dir / "ood_shards"
+    }
+    for d in shard_dirs.values():
+        d.mkdir(exist_ok=True)
+
+    total_stats = {k: 0 for k in shard_dirs.keys()}
     
     # Process in parallel
     with ProcessPoolExecutor(max_workers=args.num_workers, initializer=init_worker, initargs=(target_genes,)) as executor:
-        # Submit all tasks
-        futures = [executor.submit(process_single_h5ad_task, task) for task in tasks]
+        futures = [executor.submit(process_and_write_task, task) for task in tasks]
         
-        # Process results as they complete
         for future in tqdm(as_completed(futures), total=len(futures), desc="Processing"):
-            df_aligned, is_ood, fpath = future.result()
-            
-            if df_aligned is None or df_aligned.empty:
-                continue
+            result = future.result()
+            if result:
+                stats, created_files = result
+                for key, count in stats.items():
+                    total_stats[key] += count
                 
-            # Convert to PyArrow Table
-            table = pa.Table.from_pandas(df_aligned)
-            schema = table.schema
-            
-            if is_ood:
-                # OOD Data -> ood.parquet
-                writer = get_writer('ood', schema)
-                writer.write_table(table)
-                stats['ood'] += len(df_aligned)
-            else:
-                # Training Data -> Split 90/5/5
-                n_cells = len(df_aligned)
-                indices = np.random.permutation(n_cells)
-                
-                n_train = int(n_cells * 0.90)
-                n_val = int(n_cells * 0.05)
-                # Remainder to test
-                
-                train_idx = indices[:n_train]
-                val_idx = indices[n_train:n_train+n_val]
-                test_idx = indices[n_train+n_val:]
-                
-                if len(train_idx) > 0:
-                    t_df = df_aligned.iloc[train_idx]
-                    w = get_writer('train', schema)
-                    w.write_table(pa.Table.from_pandas(t_df, schema=schema))
-                    stats['train'] += len(t_df)
-                    
-                if len(val_idx) > 0:
-                    v_df = df_aligned.iloc[val_idx]
-                    w = get_writer('val', schema)
-                    w.write_table(pa.Table.from_pandas(v_df, schema=schema))
-                    stats['val'] += len(v_df)
-                    
-                if len(test_idx) > 0:
-                    test_df = df_aligned.iloc[test_idx]
-                    w = get_writer('test', schema)
-                    w.write_table(pa.Table.from_pandas(test_df, schema=schema))
-                    stats['test'] += len(test_df)
+                # Move temp files to final shard directories
+                for key, temp_path in created_files.items():
+                    temp_path = Path(temp_path)
+                    final_path = shard_dirs[key] / temp_path.name
+                    shutil.move(str(temp_path), str(final_path))
 
-    # Close all writers
-    for w in writers.values():
-        w.close()
-        
-    logger.info("Processing complete.")
-    logger.info(f"Statistics: {stats}")
+    logger.info(f"Processing statistics: {total_stats}")
+    
+    # Cleanup temp dir
+    shutil.rmtree(temp_dir)
+    
+    logger.info("Workflow complete. Data is stored in sharded directories:")
+    for k, v in shard_dirs.items():
+        logger.info(f"  - {k}: {v}")
 
 if __name__ == "__main__":
-    multiprocessing.set_start_method('fork', force=True)  # Ensure fork is used on Linux
+    multiprocessing.set_start_method('fork', force=True)
     main()

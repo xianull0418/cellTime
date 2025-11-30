@@ -22,14 +22,14 @@ training:
 data:
   dataset_type: parquet
   
-  # Paths to preprocessed parquet files
+  # Paths to preprocessed parquet files (or directories of shards)
   parquet_path:
-    train: data/ae_processed/train.parquet
-    val: data/ae_processed/val.parquet
-    test: data/ae_processed/test.parquet
-    ood: data/ae_processed/ood.parquet
+    train: data/ae_processed/train_shards
+    val: data/ae_processed/val_shards
+    test: data/ae_processed/test_shards
+    ood: data/ae_processed/ood_shards
     
-  num_workers: 16
+  num_workers: 8 # Reduced to avoid CPU contention / soft lockups
   pin_memory: true
 
 logging:

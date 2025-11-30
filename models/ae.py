@@ -14,7 +14,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from scimilarity.nn_models import Encoder, Decoder
 from models.utils import compute_correlation
-from dataset import ParquetDataset, collate_fn_static
+from dataset import ParquetDataset, ParquetIterableDataset, collate_fn_static
 
 class Autoencoder(nn.Module):
     """
@@ -103,7 +103,7 @@ class AESystem(pl.LightningModule):
         
         self.val_dataset = None
         self.ood_dataset = None
-
+    
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.autoencoder(x)
     
@@ -148,10 +148,13 @@ class AESystem(pl.LightningModule):
                 train_path = Path(p_cfg.train)
                 val_path = Path(p_cfg.val)
                 ood_path = Path(p_cfg.ood)
-
+                
                 # Train
                 if train_path.exists():
-                    self.train_dataset = ParquetDataset(train_path, verbose=True)
+                    # Use IterableDataset for training to handle large scale data efficiently
+                    print(f"Loading Training Data from {train_path} (Iterable Mode)...")
+                    self.train_dataset = ParquetIterableDataset(train_path, verbose=True, shuffle_shards=True, shuffle_rows=True)
+                    
                     # Update n_genes automatically
                     if self.cfg.model.n_genes != self.train_dataset.n_genes:
                         print(f"Auto-updating n_genes: {self.cfg.model.n_genes} -> {self.train_dataset.n_genes}")
@@ -161,23 +164,38 @@ class AESystem(pl.LightningModule):
                 
                 # Val
                 if val_path.exists():
-                    self.val_dataset = ParquetDataset(val_path, verbose=True)
+                    # Use IterableDataset for val as well to avoid massive RAM usage, but no shuffle
+                    self.val_dataset = ParquetIterableDataset(val_path, verbose=True, shuffle_shards=False, shuffle_rows=False)
                 else:
                     print(f"Warning: Val data not found: {val_path}")
                     
                 # OOD
                 if ood_path.exists():
-                    self.ood_dataset = ParquetDataset(ood_path, verbose=True)
-                
+                    self.ood_dataset = ParquetIterableDataset(ood_path, verbose=True, shuffle_shards=False, shuffle_rows=False)
+            
             else:
                 # Legacy support if needed, but defaulting to Parquet as per request
                 print(f"Warning: Unknown dataset_type '{dataset_type}', falling back to manual setup or error.")
     
+        # Re-initialize autoencoder if n_genes changed during setup
+        if self.autoencoder.n_genes != self.cfg.model.n_genes:
+            print(f"Re-initializing Autoencoder with n_genes={self.cfg.model.n_genes}")
+            self.autoencoder = Autoencoder(
+                n_genes=self.cfg.model.n_genes,
+                latent_dim=self.cfg.model.latent_dim,
+                hidden_dim=self.cfg.model.hidden_dim,
+                dropout_rate=self.cfg.model.dropout_rate,
+            ).to(self.device)
+            
+            # IMPORTANT: Sync reconstruction_loss_fn with model device
+            if hasattr(self, 'reconstruction_loss_fn'):
+                self.reconstruction_loss_fn = self.reconstruction_loss_fn.to(self.device)
+
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
             batch_size=self.cfg.training.batch_size,
-            shuffle=True,
+            shuffle=False, # Shuffle handled internally by IterableDataset
             num_workers=self.cfg.data.num_workers,
             pin_memory=self.cfg.data.pin_memory,
             collate_fn=collate_fn_static,

@@ -100,7 +100,7 @@ class TimestepEmbedder(nn.Module):
 
 def compute_correlation(x: torch.Tensor, x_recon: torch.Tensor) -> torch.Tensor:
     """
-    计算两个张量的皮尔逊相关系数（按样本）
+    计算两个张量的皮尔逊相关系数（按样本，向量化实现）
     
     Args:
         x: 原始数据 [B, ...]
@@ -109,28 +109,30 @@ def compute_correlation(x: torch.Tensor, x_recon: torch.Tensor) -> torch.Tensor:
     Returns:
         平均相关系数（标量）
     """
-    batch_size = x.shape[0]
-    correlations = []
+    # 展平除 batch 维以外的所有维度
+    x = x.flatten(1)
+    x_recon = x_recon.flatten(1)
     
-    for i in range(batch_size):
-        x_i = x[i].flatten()
-        x_recon_i = x_recon[i].flatten()
-        
-        # 计算皮尔逊相关系数
-        x_i_centered = x_i - x_i.mean()
-        x_recon_i_centered = x_recon_i - x_recon_i.mean()
-        
-        numerator = (x_i_centered * x_recon_i_centered).sum()
-        denominator = torch.sqrt((x_i_centered ** 2).sum() * (x_recon_i_centered ** 2).sum())
-        
-        if denominator > 1e-8:
-            corr = numerator / denominator
-            correlations.append(corr)
+    # 中心化
+    x_mean = x.mean(dim=1, keepdim=True)
+    x_recon_mean = x_recon.mean(dim=1, keepdim=True)
     
-    if correlations:
-        return torch.stack(correlations).mean()
-    else:
-        return torch.tensor(0.0, device=x.device)
+    x_centered = x - x_mean
+    x_recon_centered = x_recon - x_recon_mean
+    
+    # 计算协方差和方差
+    numerator = (x_centered * x_recon_centered).sum(dim=1)
+    var_x = (x_centered ** 2).sum(dim=1)
+    var_recon = (x_recon_centered ** 2).sum(dim=1)
+    
+    denominator = torch.sqrt(var_x * var_recon)
+    
+    # 处理分母为 0 的情况
+    mask = denominator > 1e-8
+    corr = torch.zeros_like(numerator)
+    corr[mask] = numerator[mask] / denominator[mask]
+    
+    return corr.mean()
 
 
 def create_backbone(backbone_type: str, backbone_config: dict, latent_dim: int):
