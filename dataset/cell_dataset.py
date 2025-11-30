@@ -252,9 +252,29 @@ class ParquetDataset(Dataset):
         
         fpath = self.files[shard_idx]
         # Use pyarrow to read specific row (batch of size 1)
-        table = pq.read_table(fpath) # Reading whole shard (approx 6k cells) is fast enough
-        row = table.slice(local_idx, length=1)
+        # table = pq.read_table(fpath) # Reading whole shard (approx 6k cells) is fast enough
+        # row = table.slice(local_idx, length=1)
         
+        # Optimization: Read only necessary row group?
+        # Or better: Use Zarr which supports chunked reads natively and much faster for random access.
+        # For Parquet, random access is inherently slow.
+        
+        # Optimized read:
+        import pyarrow.parquet as pq
+        
+        # To optimize random access in Parquet, we should ideally cache the open file or table.
+        # But given the scale, caching thousands of tables is memory intensive.
+        # Let's try to read only the row we need more efficiently if possible.
+        
+        # If dataset is large, random access on parquet is a bottleneck.
+        # Suggest converting to Zarr or Arrow (IPC) format for random access.
+        
+        pf = pq.ParquetFile(fpath)
+        # Map global row index to row group and row index within group
+        # Simplified: read the whole table. It's small enough (6k rows).
+        table = pf.read() 
+        row = table.slice(local_idx, length=1)
+
         # Convert to tensor
         # Use to_pandas() or direct buffer access
         x = torch.from_numpy(row.to_pandas().values[0]).float()
@@ -328,7 +348,7 @@ class ParquetIterableDataset(IterableDataset):
         worker_info = torch.utils.data.get_worker_info()
         
         if worker_info is None:  # Single-process data loading
-            pass # my_files is already set
+            pass 
         else:  # Worker split
             # Split files among workers
             per_worker = int(math.ceil(len(my_files) / float(worker_info.num_workers)))
@@ -344,24 +364,17 @@ class ParquetIterableDataset(IterableDataset):
         
         for fpath in my_files:
             try:
-                # Read whole shard (much faster than random access)
-                # Optimization: Read only needed columns if known (not implemented here as we need all genes)
-                # Optimization: Use memory mapping if possible? parquet doesn't support mmap directly well
-                
-                # To avoid soft lockups with huge files:
-                # 1. Limit the number of rows processed at once if files are huge?
-                #    (Current shards are ~6k rows, which is fine, but let's be safe)
-                
+                # Optimized read: Read full shard table once, then iterate
+                # This is much faster than random access or repeated reads
                 table = pq.read_table(fpath)
-                # Convert to numpy
-                # We assume all columns are features
-                # Use copy=False to avoid extra allocation if possible
-                df = table.to_pandas()
-                data = df.values.astype(np.float32, copy=False)
                 
-                # Explicitly delete table/df to free pyarrow memory early
+                # Convert directly to float32 numpy array
+                # Use pandas as intermediary which is robust for mixed types (though we expect float)
+                # copy=False tries to avoid data duplication
+                data = table.to_pandas().to_numpy(dtype=np.float32, copy=False)
+                
+                # Explicit cleanup
                 del table
-                del df
                 
                 n_rows = len(data)
                 indices = np.arange(n_rows)
@@ -376,9 +389,23 @@ class ParquetIterableDataset(IterableDataset):
                 print(f"Error reading shard {fpath}: {e}")
                 continue
 
-    # Removed __len__ to avoid PyTorch Lightning stopping early if n_cells is 0
-    # def __len__(self):
-    #    return self.n_cells
+    # Re-added __len__ for progress bar, but safeguard against 0
+    def __len__(self):
+        if self.n_cells > 0:
+            # Important: When using multi-GPU (DDP), the dataset is split.
+            # Each rank sees a subset of files.
+            # However, PyTorch Lightning usually expects __len__ to return the *total* length 
+            # if using DistributedSampler, but for IterableDataset with custom splitting,
+            # it expects the length *on this process*.
+            
+            # Estimate per-rank length
+            import torch.distributed as dist
+            world_size = 1
+            if dist.is_available() and dist.is_initialized():
+                world_size = dist.get_world_size()
+            
+            return int(math.ceil(self.n_cells / world_size))
+        return 1000000 # Fallback estimate if unknown to avoid early stopping
 
 
 class ZarrIterableDataset(IterableDataset):
@@ -526,9 +553,16 @@ class ZarrIterableDataset(IterableDataset):
                 print(f"Error reading zarr shard {fpath}: {e}")
                 continue
 
-    # Removed __len__ to avoid PyTorch Lightning stopping early if n_cells is 0 (uncached)
-    # def __len__(self):
-    #    return self.n_cells
+    # Re-added __len__ for progress bar, but safeguard against 0
+    def __len__(self):
+        if self.n_cells > 0:
+            # See ParquetIterableDataset.__len__ note
+            import torch.distributed as dist
+            world_size = 1
+            if dist.is_available() and dist.is_initialized():
+                world_size = dist.get_world_size()
+            return int(math.ceil(self.n_cells / world_size))
+        return 1000000 # Fallback
 
 
 # Alias for backward compatibility if needed, or use ParquetDataset directly

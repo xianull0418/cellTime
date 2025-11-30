@@ -242,6 +242,37 @@ def main():
 
     logger.info(f"Processing statistics: {total_stats}")
     
+    # Save metadata cache for each shard directory to speed up dataset loading
+    for key, d in shard_dirs.items():
+        cache_file = d / ("metadata_cache_zarr.json" if args.format == "zarr" else "metadata_cache.json")
+        n_files = 0
+        n_cells = total_stats[key]
+        
+        if args.format == "zarr":
+            files = list(d.glob("*.zarr"))
+            # Handle case where d itself is a zarr group? No, we saved shards as files/dirs inside d
+        else:
+            files = list(d.glob("*.parquet"))
+            
+        n_files = len(files)
+        
+        if n_files > 0:
+            cache = {
+                'n_files': n_files,
+                'files_hash': n_files,
+                'n_cells': n_cells,
+                # We don't have exact shard lengths here easily without re-scanning or tracking in detail above.
+                # But ZarrIterableDataset/ParquetIterableDataset mostly need n_cells for __len__
+                'shard_lengths': [], 
+                'shard_offsets': []
+            }
+            try:
+                with open(cache_file, 'w') as f:
+                    json.dump(cache, f)
+                logger.info(f"Saved metadata cache to {cache_file}")
+            except Exception as e:
+                logger.warning(f"Failed to save metadata cache: {e}")
+
     # Cleanup temp dir
     shutil.rmtree(temp_dir)
     
