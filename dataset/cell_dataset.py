@@ -104,6 +104,11 @@ def load_anndata(
     elif max_genes is not None and adata.shape[1] > max_genes and select_hvg:
         if verbose:
             print(f"基因数 ({adata.shape[1]}) 超过上限 ({max_genes})，自动选择高变基因...")
+            
+        # Fix for potential KeyError: 'base' in adata.uns['log1p'] caused by some scanpy versions
+        if 'log1p' in adata.uns and isinstance(adata.uns['log1p'], dict) and 'base' not in adata.uns['log1p']:
+            adata.uns['log1p']['base'] = None
+            
         sc.pp.highly_variable_genes(adata, n_top_genes=max_genes, subset=True)
     
     return adata

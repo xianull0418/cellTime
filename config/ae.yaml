@@ -3,21 +3,21 @@
 
 model:
   n_genes: 0  # 0 = Auto-detect from dataset
-  latent_dim: 256
-  hidden_dim: [1024, 512]
-  dropout_rate: 0.05
+  latent_dim: 512
+  hidden_dim: [4096, 2048, 1024]
+  dropout_rate: 0.1
 
 training:
-  batch_size: 2048
-  learning_rate: 1e-4
+  batch_size: 4096
+  learning_rate: 1e-3
   weight_decay: 1e-5
   max_epochs: 50
-  reconstruction_loss: mse  # mse / poisson / smooth_l1
+  reconstruction_loss: smooth_l1  # mse / poisson / smooth_l1
   
   scheduler:
     mode: min
     factor: 0.5
-    patience: 5
+    patience: 10
 
 data:
   dataset_type: parquet
@@ -29,14 +29,14 @@ data:
     test: data/ae_processed/test_shards
     ood: data/ae_processed/ood_shards
     
-  num_workers: 8 # Reduced to avoid CPU contention / soft lockups
+  num_workers: 16
   pin_memory: true
 
 logging:
   output_dir: output/ae
   log_every_n_steps: 50
-  val_check_interval: 2000 # Check validation every 2000 batches (approx 10% of epoch if ~20k batches)
-  log_embeddings_every_n_epochs: 10
+  val_check_interval: 1.0
+  log_embeddings_every_n_epochs: 5
 
 accelerator:
   accelerator: auto

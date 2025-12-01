@@ -90,9 +90,9 @@ def evaluate_dataset(model, dataset, device, max_batches=None, desc="Evaluating"
 
 def main():
     # Paths
-    ckpt_path = "output/ae_large_scale/scbank_run/checkpoints/ae-epoch=00-val_loss=0.0871.ckpt"
+    ckpt_path = "/gpfs/flash/home/jcw/projects/research/cellTime/output/ae_large_scale/version2_8epochs/checkpoints/last.ckpt"
     processed_dir = Path("/gpfs/hybrid/data/downloads/gcloud/arc-scbasecount/2025-02-25/h5ad/GeneFull_Ex50pAS/Homo_sapiens/.parquet")
-    output_dir = Path("benchmarks/results")
+    output_dir = Path("benchmarks/results/ae-epoch=07-val_loss=0.0904.ckpt")
     output_dir.mkdir(parents=True, exist_ok=True)
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

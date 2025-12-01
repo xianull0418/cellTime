@@ -12,14 +12,83 @@ from typing import Optional, Tuple, Dict, Any, List
 from pathlib import Path
 from omegaconf import DictConfig, OmegaConf
 
-from scimilarity.nn_models import Encoder, Decoder
+# from scimilarity.nn_models import Encoder, Decoder # Removed dependency
 from models.utils import compute_correlation
 from dataset import ParquetDataset, ParquetIterableDataset, ZarrIterableDataset, collate_fn_static
+
+class MLPBlock(nn.Module):
+    """
+    Basic MLP Block with LayerNorm, GELU and Residual Connection (if dims match)
+    """
+    def __init__(self, in_dim: int, out_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+        self.norm = nn.LayerNorm(out_dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.has_residual = (in_dim == out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.linear(x)
+        x = self.norm(x)
+        x = self.act(x)
+        x = self.dropout(x)
+        
+        if self.has_residual:
+            x = x + residual
+        return x
+
+class Encoder(nn.Module):
+    def __init__(self, n_genes: int, latent_dim: int, hidden_dim: List[int], dropout: float = 0.1):
+        super().__init__()
+        layers = []
+        in_dim = n_genes
+        
+        # Input projection -> Hidden layers
+        for h_dim in hidden_dim:
+            layers.append(MLPBlock(in_dim, h_dim, dropout))
+            in_dim = h_dim
+            
+        # Final projection to latent
+        self.hidden_layers = nn.Sequential(*layers)
+        self.to_latent = nn.Linear(in_dim, latent_dim)
+        # Optional: LayerNorm on latent? Usually raw linear is fine for AE bottleneck.
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.hidden_layers(x)
+        z = self.to_latent(x)
+        return z
+
+class Decoder(nn.Module):
+    def __init__(self, n_genes: int, latent_dim: int, hidden_dim: List[int], dropout: float = 0.1):
+        super().__init__()
+        layers = []
+        # Reverse hidden dims for decoder
+        hidden_dim = hidden_dim[::-1]
+        
+        in_dim = latent_dim
+        for h_dim in hidden_dim:
+            layers.append(MLPBlock(in_dim, h_dim, dropout))
+            in_dim = h_dim
+            
+        self.hidden_layers = nn.Sequential(*layers)
+        self.to_output = nn.Linear(in_dim, n_genes)
+        
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        x = self.hidden_layers(z)
+        out = self.to_output(x)
+        # Since input is log1p (non-negative), we can enforce non-negativity.
+        # However, raw linear allows gradient to flow back even if prediction is negative initially.
+        # Let's just return raw logits for loss function to handle, 
+        # OR apply ReLU if we are sure target is non-negative.
+        # Given it's scRNA-seq log1p data, it is strictly >= 0.
+        return F.relu(out) 
 
 class Autoencoder(nn.Module):
     """
     Autoencoder 模型
-    基于 scimilarity 的 Encoder/Decoder
+    Custom Implementation with Residual MLP Blocks
     """
     
     def __init__(
@@ -40,14 +109,14 @@ class Autoencoder(nn.Module):
         self.encoder = Encoder(
             n_genes=n_genes,
             latent_dim=latent_dim,
-            hidden_dim=hidden_dim.copy(),
+            hidden_dim=hidden_dim, # Do not copy, just pass list
             dropout=dropout_rate,
         )
         
         self.decoder = Decoder(
             n_genes=n_genes,
             latent_dim=latent_dim,
-            hidden_dim=hidden_dim.copy(),
+            hidden_dim=hidden_dim, # Do not copy
             dropout=dropout_rate,
         )
 
@@ -80,10 +149,13 @@ class AESystem(pl.LightningModule):
         
         cfg = self.cfg
         
+        # Convert hidden_dim to list if it's OmegaConf ListConfig
+        hidden_dim = list(cfg.model.hidden_dim) if hasattr(cfg.model.hidden_dim, '__iter__') else cfg.model.hidden_dim
+
         self.autoencoder = Autoencoder(
             n_genes=cfg.model.n_genes,
             latent_dim=cfg.model.latent_dim,
-            hidden_dim=cfg.model.hidden_dim,
+            hidden_dim=hidden_dim,
             dropout_rate=cfg.model.dropout_rate,
         )
         
@@ -206,10 +278,13 @@ class AESystem(pl.LightningModule):
         # Re-initialize autoencoder if n_genes changed during setup
         if self.autoencoder.n_genes != self.cfg.model.n_genes:
             print(f"Re-initializing Autoencoder with n_genes={self.cfg.model.n_genes}")
+            # Convert hidden_dim to list again for safety
+            hidden_dim = list(self.cfg.model.hidden_dim) if hasattr(self.cfg.model.hidden_dim, '__iter__') else self.cfg.model.hidden_dim
+            
             self.autoencoder = Autoencoder(
                 n_genes=self.cfg.model.n_genes,
                 latent_dim=self.cfg.model.latent_dim,
-                hidden_dim=self.cfg.model.hidden_dim,
+                hidden_dim=hidden_dim,
                 dropout_rate=self.cfg.model.dropout_rate,
             ).to(self.device)
             
@@ -229,18 +304,6 @@ class AESystem(pl.LightningModule):
     
     def val_dataloader(self):
         if not self.val_dataset: 
-            # Return an empty list or None is tricky in PL
-            # Better to return a dummy dataloader or handle this case
-            # If we return None, PL complains.
-            # Let's try returning an empty DataLoader if dataset is missing, but ideally we should have val data.
-            # If truly no val data, maybe we should skip val? 
-            # For now, let's assume if it's None, we return an empty list which acts as an empty iterator?
-            # Actually, the error says "TypeError: 'NoneType' object is not iterable" which implies PL tried to iterate over None.
-            # Correct fix: if no val dataset, don't return None if PL expects it. 
-            # However, PL supports None for val_dataloader IF limit_val_batches=0. 
-            
-            # Let's just return a dummy empty list which is iterable, although PL might expect DataLoader.
-            # Safer: create a dummy dataset.
             return [] 
         return DataLoader(
             self.val_dataset,
