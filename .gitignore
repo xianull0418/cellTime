@@ -7,6 +7,10 @@
 /notebooks
 /tests
 /LICENSE
+annotation/trae.md
+
+annotation/data/**
+
 *output
 pym*
 
