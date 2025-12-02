@@ -52,6 +52,7 @@ def train(
         enable_checkpointing=True,
         default_root_dir=cfg.logging.output_dir,
         gradient_clip_val=cfg.accelerator.gradient_clip_val,
+        limit_val_batches=100, # Limit validation to 100 batches for stability and speed
         callbacks=[
             pl.callbacks.ModelCheckpoint(
                 dirpath=Path(cfg.logging.output_dir) / "checkpoints",
@@ -62,11 +63,12 @@ def train(
                 save_last=True,
             ),
             pl.callbacks.LearningRateMonitor(logging_interval='epoch'),
-            pl.callbacks.EarlyStopping(
-                monitor="val_loss",
-                patience=10,
-                mode="min",
-            ),
+            # pl.callbacks.EarlyStopping(
+            #     monitor="val_loss",
+            #     patience=10,
+            #     mode="min",
+            #     check_on_train_epoch_end=False,  # Only check after validation
+            # ),
             pl.callbacks.RichProgressBar(),
         ],
     )

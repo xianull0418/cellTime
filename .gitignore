@@ -12,3 +12,5 @@ pym*
 
 dataset/__pycache__
 __pycache__/
+
+benchmarks/results

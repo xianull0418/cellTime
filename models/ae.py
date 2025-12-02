@@ -151,7 +151,7 @@ class AESystem(pl.LightningModule):
         
         # Convert hidden_dim to list if it's OmegaConf ListConfig
         hidden_dim = list(cfg.model.hidden_dim) if hasattr(cfg.model.hidden_dim, '__iter__') else cfg.model.hidden_dim
-
+        
         self.autoencoder = Autoencoder(
             n_genes=cfg.model.n_genes,
             latent_dim=cfg.model.latent_dim,

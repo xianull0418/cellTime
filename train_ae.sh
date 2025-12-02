@@ -1,6 +1,6 @@
 #!/bin/bash
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 # 1. 强制禁用 Infiniband (因为它们全是 DOWN 的，这是报错的主因)
 export NCCL_IB_DISABLE=1
@@ -27,7 +27,7 @@ export NCCL_SOCKET_IFNAME=enp83s0f0
 
 DATA_DIR=${1:-"/gpfs/hybrid/data/downloads/gcloud/arc-scbasecount/2025-02-25/h5ad/GeneFull_Ex50pAS/Homo_sapiens"}
 VOCAB_FILE=${2:-"data_info/gene_order.tsv"}
-OUTPUT_DIR=${3:-"output/ae_large_scale/version2_8epochs"}
+OUTPUT_DIR=${3:-"output/ae_large_scale/version3_larger"}
 CSV_INFO="data_info/ae_data_info.csv"
 
 PROCESSED_DIR="${DATA_DIR}/.parquet"
@@ -73,8 +73,8 @@ python train_ae.py \
     --data.processed_path.test="$PROCESSED_DIR/test_shards" \
     --data.processed_path.ood="$PROCESSED_DIR/ood_shards" \
     --logging.output_dir="$OUTPUT_DIR" \
-    --training.max_epochs=20 \
+    --training.max_epochs=1 \
     --accelerator.precision="16-mixed" \
-    --data.num_workers=16
+    --data.num_workers=4
 
 echo "Workflow finished."
