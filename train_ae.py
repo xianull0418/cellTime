@@ -75,14 +75,14 @@ def train(
     
     # Start Training
     if trainer.global_rank == 0:
-        print("Starting training...")
+    print("Starting training...")
     trainer.fit(system)
     
     if trainer.global_rank == 0:
-        print(f"\nTraining finished!")
-        if trainer.checkpoint_callback.best_model_path:
-            print(f"Best model saved at: {trainer.checkpoint_callback.best_model_path}")
-            print(f"Best val_loss: {trainer.checkpoint_callback.best_model_score:.6f}")
+    print(f"\nTraining finished!")
+    if trainer.checkpoint_callback.best_model_path:
+        print(f"Best model saved at: {trainer.checkpoint_callback.best_model_path}")
+        print(f"Best val_loss: {trainer.checkpoint_callback.best_model_score:.6f}")
 
 if __name__ == "__main__":
     fire.Fire(train)

@@ -300,6 +300,7 @@ class AESystem(pl.LightningModule):
             num_workers=self.cfg.data.num_workers,
             pin_memory=self.cfg.data.pin_memory,
             collate_fn=collate_fn_static,
+            drop_last=True, # Drop incomplete batches to avoid DDP deadlocks
         )
     
     def val_dataloader(self):
@@ -312,6 +313,7 @@ class AESystem(pl.LightningModule):
             num_workers=self.cfg.data.num_workers,
             pin_memory=self.cfg.data.pin_memory,
             collate_fn=collate_fn_static,
+            drop_last=True, # Consistent behavior
         )
     
     def test_dataloader(self):
@@ -330,32 +332,45 @@ class AESystem(pl.LightningModule):
         x = batch
         x_reconstructed, latent = self.forward(x)
         recon_loss = self.reconstruction_loss_fn(x_reconstructed, x)
-        
-        self.log("train_loss", recon_loss, prog_bar=True, on_step=True, on_epoch=True)
+
+        # Use sync_dist=True for multi-GPU training to properly aggregate metrics
+        self.log("train_loss", recon_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+
+        # Return loss for backprop - PyTorch Lightning handles this correctly
         return recon_loss
     
-    def validation_step(self, batch: torch.Tensor, batch_idx: int) -> Dict[str, Any]:
+    def validation_step(self, batch: torch.Tensor, batch_idx: int) -> None:
         x = batch
         x_reconstructed, latent = self.forward(x)
         recon_loss = self.reconstruction_loss_fn(x_reconstructed, x)
-        mse = F.mse_loss(x_reconstructed, x)
-        correlation = compute_correlation(x, x_reconstructed)
+
+        # Detach metrics to avoid memory leaks
+        # These metrics don't need gradients and shouldn't keep computation graph
+        with torch.no_grad():
+            mse = F.mse_loss(x_reconstructed, x)
+            correlation = compute_correlation(x, x_reconstructed)
+
+        # Log with sync_dist for multi-GPU training
+        self.log("val_loss", recon_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val_mse", mse, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val_correlation", correlation, on_step=False, on_epoch=True, sync_dist=True)
+
+        # Don't return anything - PyTorch Lightning will handle logging
+        # Returning tensors can cause memory leaks by keeping computation graphs
         
-        self.log("val_loss", recon_loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log("val_mse", mse, on_step=False, on_epoch=True)
-        self.log("val_correlation", correlation, on_step=False, on_epoch=True)
-        
-        return {"val_loss": recon_loss}
-        
-    def test_step(self, batch: torch.Tensor, batch_idx: int) -> Dict[str, Any]:
+    def test_step(self, batch: torch.Tensor, batch_idx: int) -> None:
         x = batch
         x_reconstructed, latent = self.forward(x)
         recon_loss = self.reconstruction_loss_fn(x_reconstructed, x)
-        mse = F.mse_loss(x_reconstructed, x)
-        correlation = compute_correlation(x, x_reconstructed)
-        
-        self.log("ood_loss", recon_loss, prog_bar=True, on_step=False, on_epoch=True)
-        self.log("ood_mse", mse, on_step=False, on_epoch=True)
-        self.log("ood_correlation", correlation, on_step=False, on_epoch=True)
-        
-        return {"ood_loss": recon_loss}
+
+        # Detach metrics to avoid memory leaks
+        with torch.no_grad():
+            mse = F.mse_loss(x_reconstructed, x)
+            correlation = compute_correlation(x, x_reconstructed)
+
+        # Log with sync_dist for multi-GPU training
+        self.log("ood_loss", recon_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("ood_mse", mse, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("ood_correlation", correlation, on_step=False, on_epoch=True, sync_dist=True)
+
+        # Don't return anything to avoid memory leaks

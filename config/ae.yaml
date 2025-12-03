@@ -8,7 +8,7 @@ model:
   dropout_rate: 0.1
 
 training:
-  batch_size: 2048
+  batch_size: 4096
   learning_rate: 1e-3
   weight_decay: 1e-5
   max_epochs: 50
@@ -29,7 +29,7 @@ data:
     test: data/ae_processed/test_shards
     ood: data/ae_processed/ood_shards
     
-  num_workers: 16
+  num_workers: 0
   pin_memory: true
 
 logging:

@@ -1,6 +1,6 @@
 #!/bin/bash
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,3,2,4,5,6,7
 
 # 1. 强制禁用 Infiniband (因为它们全是 DOWN 的，这是报错的主因)
 export NCCL_IB_DISABLE=1
@@ -17,6 +17,8 @@ export NCCL_IB_DISABLE=1
 
 # 3. 指定网卡 (解决之前的 IP 问题)
 export NCCL_SOCKET_IFNAME=enp83s0f0
+
+export NCCL_TIMEOUT=300
 # Autoencoder Training Script (Refactored)
 # 
 # Workflow:

@@ -343,11 +343,10 @@ class ParquetIterableDataset(IterableDataset):
             rank = 0
             world_size = 1
             
-        # Split files among ranks
-        per_rank = int(math.ceil(len(self.files) / float(world_size)))
-        rank_start = rank * per_rank
-        rank_end = min(rank_start + per_rank, len(self.files))
-        my_files = self.files[rank_start:rank_end]
+        # Split files among ranks using Round Robin to ensure balance
+        # Old: Block split caused imbalance (last rank has much fewer files)
+        # my_files = self.files[rank_start:rank_end]
+        my_files = self.files[rank::world_size]
 
         # 2. Local Split (per Worker)
         worker_info = torch.utils.data.get_worker_info()
@@ -355,12 +354,10 @@ class ParquetIterableDataset(IterableDataset):
         if worker_info is None:  # Single-process data loading
             pass 
         else:  # Worker split
-            # Split files among workers
-            per_worker = int(math.ceil(len(my_files) / float(worker_info.num_workers)))
+            # Split files among workers using Round Robin
             worker_id = worker_info.id
-            iter_start = worker_id * per_worker
-            iter_end = min(iter_start + per_worker, len(my_files))
-            my_files = my_files[iter_start:iter_end]
+            num_workers = worker_info.num_workers
+            my_files = my_files[worker_id::num_workers]
             
         if self.shuffle_shards:
             np.random.shuffle(my_files)
@@ -492,21 +489,16 @@ class ZarrIterableDataset(IterableDataset):
             rank = 0
             world_size = 1
             
-        # Split files among ranks
-        per_rank = int(math.ceil(len(self.files) / float(world_size)))
-        rank_start = rank * per_rank
-        rank_end = min(rank_start + per_rank, len(self.files))
-        my_files = self.files[rank_start:rank_end]
+        # Split files among ranks (Round Robin)
+        my_files = self.files[rank::world_size]
 
         # 2. Local Split (per Worker)
         worker_info = torch.utils.data.get_worker_info()
         
         if worker_info is not None:
-            per_worker = int(math.ceil(len(my_files) / float(worker_info.num_workers)))
             worker_id = worker_info.id
-            iter_start = worker_id * per_worker
-            iter_end = min(iter_start + per_worker, len(my_files))
-            my_files = my_files[iter_start:iter_end]
+            num_workers = worker_info.num_workers
+            my_files = my_files[worker_id::num_workers]
             
         if self.shuffle_shards:
             np.random.shuffle(my_files)
