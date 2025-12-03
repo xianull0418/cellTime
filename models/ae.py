@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from typing import Optional, Tuple, Dict, Any, List
 from pathlib import Path
 from omegaconf import DictConfig, OmegaConf
+import logging
 
 # from scimilarity.nn_models import Encoder, Decoder # Removed dependency
 from models.utils import compute_correlation
@@ -212,72 +213,75 @@ class AESystem(pl.LightningModule):
             dataset_type = self.cfg.data.get("dataset_type", "parquet")
             # Renamed from parquet_path to processed_path for generality
             p_cfg = self.cfg.data.get("processed_path", self.cfg.data.get("parquet_path", None))
-            
+
+            # Get debug flag from config
+            debug_mode = self.cfg.get("debug", False)
+
             if not p_cfg:
                  raise ValueError(f"dataset_type='{dataset_type}' but data.processed_path is missing in config.")
 
             train_path = Path(p_cfg.train)
             val_path = Path(p_cfg.val)
             ood_path = Path(p_cfg.ood)
-            
+
             if dataset_type == "zarr":
-                print("Setting up Zarr datasets...")
-                
+                logging.info("Setting up Zarr datasets...")
+
                 # Train
                 if train_path.exists():
-                    print(f"Loading Training Data from {train_path} (Zarr Iterable Mode)...")
-                    self.train_dataset = ZarrIterableDataset(train_path, verbose=True, shuffle_shards=True, shuffle_rows=True)
-                    
+                    logging.info(f"Loading Training Data from {train_path} (Zarr Iterable Mode)...")
+                    self.train_dataset = ZarrIterableDataset(train_path, verbose=True, shuffle_shards=True, shuffle_rows=True, debug=debug_mode)
+
                     if self.cfg.model.n_genes != self.train_dataset.n_genes:
-                        print(f"Auto-updating n_genes: {self.cfg.model.n_genes} -> {self.train_dataset.n_genes}")
+                        logging.info(f"Auto-updating n_genes: {self.cfg.model.n_genes} -> {self.train_dataset.n_genes}")
                         self.cfg.model.n_genes = self.train_dataset.n_genes
                 else:
                     raise FileNotFoundError(f"Train data not found: {train_path}")
-                
+
                 # Val
                 if val_path.exists():
-                    self.val_dataset = ZarrIterableDataset(val_path, verbose=True, shuffle_shards=False, shuffle_rows=False)
+                    self.val_dataset = ZarrIterableDataset(val_path, verbose=True, shuffle_shards=False, shuffle_rows=False, debug=debug_mode)
                 else:
-                    print(f"Warning: Val data not found: {val_path}")
-                    
+                    logging.warning(f"Val data not found: {val_path}")
+
                 # OOD
                 if ood_path.exists():
-                    self.ood_dataset = ZarrIterableDataset(ood_path, verbose=True, shuffle_shards=False, shuffle_rows=False)
+                    self.ood_dataset = ZarrIterableDataset(ood_path, verbose=True, shuffle_shards=False, shuffle_rows=False, debug=debug_mode)
 
             elif dataset_type == "parquet":
-                print("Setting up Parquet datasets...")
-                
+                logging.info("Setting up Parquet datasets...")
+
                 # Train
                 if train_path.exists():
                     # Use IterableDataset for training to handle large scale data efficiently
-                    print(f"Loading Training Data from {train_path} (Iterable Mode)...")
-                    self.train_dataset = ParquetIterableDataset(train_path, verbose=True, shuffle_shards=True, shuffle_rows=True)
-                    
+                    logging.info(f"Loading Training Data from {train_path} (Iterable Mode)...")
+                    self.train_dataset = ParquetIterableDataset(train_path, verbose=True, shuffle_shards=True, shuffle_rows=True, debug=debug_mode)
+
                     # Update n_genes automatically
                     if self.cfg.model.n_genes != self.train_dataset.n_genes:
-                        print(f"Auto-updating n_genes: {self.cfg.model.n_genes} -> {self.train_dataset.n_genes}")
+                        logging.info(f"Auto-updating n_genes: {self.cfg.model.n_genes} -> {self.train_dataset.n_genes}")
                         self.cfg.model.n_genes = self.train_dataset.n_genes
                 else:
                     raise FileNotFoundError(f"Train data not found: {train_path}")
-                
+
                 # Val
                 if val_path.exists():
                     # Use IterableDataset for val as well to avoid massive RAM usage, but no shuffle
-                    self.val_dataset = ParquetIterableDataset(val_path, verbose=True, shuffle_shards=False, shuffle_rows=False)
+                    self.val_dataset = ParquetIterableDataset(val_path, verbose=True, shuffle_shards=False, shuffle_rows=False, debug=debug_mode)
                 else:
-                    print(f"Warning: Val data not found: {val_path}")
-                    
+                    logging.warning(f"Val data not found: {val_path}")
+
                 # OOD
                 if ood_path.exists():
-                    self.ood_dataset = ParquetIterableDataset(ood_path, verbose=True, shuffle_shards=False, shuffle_rows=False)
-            
+                    self.ood_dataset = ParquetIterableDataset(ood_path, verbose=True, shuffle_shards=False, shuffle_rows=False, debug=debug_mode)
+
             else:
                 # Legacy support if needed
-                print(f"Warning: Unknown dataset_type '{dataset_type}', falling back to manual setup or error.")
+                logging.warning(f"Unknown dataset_type '{dataset_type}', falling back to manual setup or error.")
 
         # Re-initialize autoencoder if n_genes changed during setup
         if self.autoencoder.n_genes != self.cfg.model.n_genes:
-            print(f"Re-initializing Autoencoder with n_genes={self.cfg.model.n_genes}")
+            logging.info(f"Re-initializing Autoencoder with n_genes={self.cfg.model.n_genes}")
             # Convert hidden_dim to list again for safety
             hidden_dim = list(self.cfg.model.hidden_dim) if hasattr(self.cfg.model.hidden_dim, '__iter__') else self.cfg.model.hidden_dim
             
@@ -336,6 +340,11 @@ class AESystem(pl.LightningModule):
         # Use sync_dist=True for multi-GPU training to properly aggregate metrics
         self.log("train_loss", recon_loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
 
+        # DEBUG: Log progress periodically
+        if self.cfg.get("debug", False) and batch_idx % 100 == 0:
+            rank = self.trainer.global_rank if self.trainer else 0
+            logging.debug(f"[Rank {rank}] Training step {batch_idx}, loss={recon_loss.item():.4f}")
+
         # Return loss for backprop - PyTorch Lightning handles this correctly
         return recon_loss
     
@@ -354,6 +363,11 @@ class AESystem(pl.LightningModule):
         self.log("val_loss", recon_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val_mse", mse, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val_correlation", correlation, on_step=False, on_epoch=True, sync_dist=True)
+
+        # DEBUG: Log validation progress
+        if self.cfg.get("debug", False) and batch_idx % 20 == 0:
+            rank = self.trainer.global_rank if self.trainer else 0
+            logging.debug(f"[Rank {rank}] Validation step {batch_idx}, loss={recon_loss.item():.4f}")
 
         # Don't return anything - PyTorch Lightning will handle logging
         # Returning tensors can cause memory leaks by keeping computation graphs

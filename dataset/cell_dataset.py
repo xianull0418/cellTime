@@ -15,6 +15,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import math
+import logging
 
 try:
     import zarr
@@ -291,11 +292,12 @@ class ParquetIterableDataset(IterableDataset):
     Iterative Parquet Dataset for efficient training on large sharded datasets.
     Avoids random access overhead by reading full shards and shuffling in memory.
     """
-    def __init__(self, path: Union[str, Path], verbose: bool = False, shuffle_shards: bool = True, shuffle_rows: bool = True):
+    def __init__(self, path: Union[str, Path], verbose: bool = False, shuffle_shards: bool = True, shuffle_rows: bool = True, debug: bool = False):
         self.path = Path(path)
         self.verbose = verbose
         self.shuffle_shards = shuffle_shards
         self.shuffle_rows = shuffle_rows
+        self.debug = debug  # Add debug flag
         self.files = []
         
         if self.path.is_dir():
@@ -334,7 +336,7 @@ class ParquetIterableDataset(IterableDataset):
 
     def __iter__(self):
         import torch.distributed as dist
-        
+
         # 1. Global Split (per Rank/GPU)
         if dist.is_available() and dist.is_initialized():
             rank = dist.get_rank()
@@ -342,7 +344,7 @@ class ParquetIterableDataset(IterableDataset):
         else:
             rank = 0
             world_size = 1
-            
+
         # Split files among ranks using Round Robin to ensure balance
         # Old: Block split caused imbalance (last rank has much fewer files)
         # my_files = self.files[rank_start:rank_end]
@@ -350,46 +352,68 @@ class ParquetIterableDataset(IterableDataset):
 
         # 2. Local Split (per Worker)
         worker_info = torch.utils.data.get_worker_info()
-        
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+
         if worker_info is None:  # Single-process data loading
-            pass 
+            pass
         else:  # Worker split
             # Split files among workers using Round Robin
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
             my_files = my_files[worker_id::num_workers]
-            
+
+        # DEBUG: Print file distribution
+        if self.debug or self.verbose:
+            logging.debug(f"[Rank {rank}/{world_size} Worker {worker_id}/{num_workers}] "
+                         f"Processing {len(my_files)}/{len(self.files)} files from {self.path.name}")
+
         if self.shuffle_shards:
             np.random.shuffle(my_files)
-            
+
         import pyarrow.parquet as pq
-        
-        for fpath in my_files:
+
+        total_samples_yielded = 0
+        for shard_idx, fpath in enumerate(my_files):
             try:
+                if self.debug:
+                    logging.debug(f"[Rank {rank} Worker {worker_id}] Reading shard {shard_idx+1}/{len(my_files)}: {fpath.name}")
+
                 # Optimized read: Read full shard table once, then iterate
                 # This is much faster than random access or repeated reads
                 table = pq.read_table(fpath)
-                
+
                 # Convert directly to float32 numpy array
                 # Use pandas as intermediary which is robust for mixed types (though we expect float)
                 # copy=False tries to avoid data duplication
                 data = table.to_pandas().to_numpy(dtype=np.float32, copy=False)
-                
+
                 # Explicit cleanup
                 del table
-                
+
                 n_rows = len(data)
                 indices = np.arange(n_rows)
-                
+
                 if self.shuffle_rows:
                     np.random.shuffle(indices)
-                
+
                 for idx in indices:
                     yield torch.from_numpy(data[idx])
-                    
+                    total_samples_yielded += 1
+
+                # Cleanup after each shard
+                del data
+
+                if self.debug:
+                    logging.debug(f"[Rank {rank} Worker {worker_id}] Completed shard {shard_idx+1}/{len(my_files)}, "
+                                 f"total samples yielded: {total_samples_yielded}")
+
             except Exception as e:
-                print(f"Error reading shard {fpath}: {e}")
+                logging.error(f"[Rank {rank} Worker {worker_id}] Error reading shard {fpath}: {e}")
                 continue
+
+        # DEBUG: Mark completion
+        if self.debug or self.verbose:
+            logging.debug(f"[Rank {rank} Worker {worker_id}] COMPLETED iteration, "
+                         f"total samples: {total_samples_yielded}")
 
     # Re-added __len__ for progress bar, but safeguard against 0
     def __len__(self):
@@ -415,11 +439,12 @@ class ZarrIterableDataset(IterableDataset):
     Iterative Dataset for efficient training on large Zarr datasets (sharded or consolidated).
     Reads chunks efficiently.
     """
-    def __init__(self, path: Union[str, Path], verbose: bool = False, shuffle_shards: bool = True, shuffle_rows: bool = True):
+    def __init__(self, path: Union[str, Path], verbose: bool = False, shuffle_shards: bool = True, shuffle_rows: bool = True, debug: bool = False):
         self.path = Path(path)
         self.verbose = verbose
         self.shuffle_shards = shuffle_shards
         self.shuffle_rows = shuffle_rows
+        self.debug = debug  # Add debug flag
         
         if zarr is None:
             raise ImportError("Please install zarr: pip install zarr")
@@ -480,7 +505,7 @@ class ZarrIterableDataset(IterableDataset):
     def __iter__(self):
         # DDP and Worker splitting
         import torch.distributed as dist
-        
+
         # 1. Global Split (per Rank/GPU)
         if dist.is_available() and dist.is_initialized():
             rank = dist.get_rank()
@@ -488,35 +513,39 @@ class ZarrIterableDataset(IterableDataset):
         else:
             rank = 0
             world_size = 1
-            
+
         # Split files among ranks (Round Robin)
         my_files = self.files[rank::world_size]
 
         # 2. Local Split (per Worker)
         worker_info = torch.utils.data.get_worker_info()
-        
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+
         if worker_info is not None:
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
             my_files = my_files[worker_id::num_workers]
-            
+
+        # DEBUG: Print file distribution
+        if self.debug or self.verbose:
+            logging.debug(f"[Rank {rank}/{world_size} Worker {worker_id}/{num_workers}] "
+                         f"Processing {len(my_files)}/{len(self.files)} Zarr files from {self.path.name}")
+
         if self.shuffle_shards:
             np.random.shuffle(my_files)
-            
-        if self.verbose:
-            # Only print for first worker on first rank to avoid clutter
-            if (worker_info is None or worker_info.id == 0) and rank == 0:
-                print(f"Rank {rank} Worker {0 if worker_info is None else worker_info.id} starting with {len(my_files)} files.")
 
-        for fpath in my_files:
+        total_samples_yielded = 0
+        for shard_idx, fpath in enumerate(my_files):
             try:
+                if self.debug:
+                    logging.debug(f"[Rank {rank} Worker {worker_id}] Reading Zarr shard {shard_idx+1}/{len(my_files)}: {fpath.name}")
+
                 store = zarr.open_group(str(fpath), mode='r')
                 # Assume X is the data
                 X = store["X"]
-                
+
                 # We can read the whole X if shard is small, or chunk by chunk
                 # For simplicity and speed (given shards are small ~6k rows), read full X
-                
+
                 # Handle Sparse Zarr (as saved by scimilarity/anndata)
                 if isinstance(X, zarr.hierarchy.Group) and "data" in X and "indices" in X and "indptr" in X:
                     from scipy.sparse import csr_matrix
@@ -530,25 +559,38 @@ class ZarrIterableDataset(IterableDataset):
                 else:
                     # Dense Zarr
                     # Converting to numpy array loads into memory
-                    data = X[:] 
-                
+                    data = X[:]
+
                 if hasattr(data, "toarray"): # Handle sparse if stored as sparse object (unlikely with standard zarr without wrapper)
                     data = data.toarray()
-                
+
                 data = data.astype(np.float32, copy=False)
-                
+
                 n_rows = len(data)
                 indices = np.arange(n_rows)
-                
+
                 if self.shuffle_rows:
                     np.random.shuffle(indices)
-                
+
                 for idx in indices:
                     yield torch.from_numpy(data[idx])
-                    
+                    total_samples_yielded += 1
+
+                # Cleanup
+                del data
+
+                if self.debug:
+                    logging.debug(f"[Rank {rank} Worker {worker_id}] Completed Zarr shard {shard_idx+1}/{len(my_files)}, "
+                                 f"total samples yielded: {total_samples_yielded}")
+
             except Exception as e:
-                print(f"Error reading zarr shard {fpath}: {e}")
+                logging.error(f"[Rank {rank} Worker {worker_id}] Error reading zarr shard {fpath}: {e}")
                 continue
+
+        # DEBUG: Mark completion
+        if self.debug or self.verbose:
+            logging.debug(f"[Rank {rank} Worker {worker_id}] COMPLETED Zarr iteration, "
+                         f"total samples: {total_samples_yielded}")
 
     # Re-added __len__ for progress bar, but safeguard against 0
     def __len__(self):

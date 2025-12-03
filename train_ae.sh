@@ -66,7 +66,29 @@ fi
 # Step 2: Training
 echo "[Step 2] Training Autoencoder..."
 
+# Create log directory
+mkdir -p "$OUTPUT_DIR/logs"
+
+# Define log files with timestamp
+TRAIN_LOG="$OUTPUT_DIR/logs/train_$(date +%Y%m%d_%H%M%S).log"
+
+echo ""
+echo "================================================================================"
+echo "Training logs will be saved to:"
+echo "  $TRAIN_LOG"
+echo ""
+echo "To monitor training in real-time, open a new terminal and run:"
+echo "  tail -f $TRAIN_LOG"
+echo ""
+echo "For debug logs from each GPU rank:"
+echo "  tail -f $OUTPUT_DIR/logs/debug_rank*.log"
+echo "================================================================================"
+echo ""
+echo "Starting training (output redirected to log file)..."
+
 # Note: Updated paths to point to shard DIRECTORIES
+# Added --debug=true for debugging hanging issues
+# Redirect all output to log file
 python train_ae.py \
     --config_path="config/ae.yaml" \
     --data.dataset_type="parquet" \
@@ -77,6 +99,19 @@ python train_ae.py \
     --logging.output_dir="$OUTPUT_DIR" \
     --training.max_epochs=1 \
     --accelerator.precision="16-mixed" \
-    --data.num_workers=4
+    --data.num_workers=2 \
+    --debug=true \
+    >> "$TRAIN_LOG" 2>&1
 
+TRAIN_EXIT_CODE=$?
+
+echo ""
+if [ $TRAIN_EXIT_CODE -eq 0 ]; then
+    echo "✓ Training completed successfully!"
+else
+    echo "✗ Training failed with exit code: $TRAIN_EXIT_CODE"
+    echo "  Check logs for details: $TRAIN_LOG"
+fi
+echo ""
+echo "Full logs saved to: $TRAIN_LOG"
 echo "Workflow finished."
