@@ -1,7 +1,8 @@
 # RTF Only Configuration
 model:
   backbone: unet  # unet, dit, mlp
-  n_genes: 3000   # Input dimension (must match dataset)
+  n_genes: 0      # 0 = auto-detect from target_genes_path
+  mode: direct    # direct or inversion
   ln_noise: true
   normalize: false # Whether to normalize inputs to unit sphere
   use_cond: false
@@ -15,7 +16,11 @@ training:
   sample_steps: 50
   cfg_scale: 2.0
   sample_every_n_epochs: 5
-  
+
+  # 一致性损失配置
+  use_consistency: false      # 是否启用一致性损失
+  consistency_weight: 0.1     # 一致性损失权重
+
   scheduler:
     type: cosine
     T_max: 100
@@ -27,7 +32,7 @@ data:
   next_cell_col: next_cell_id
   num_workers: 4
   pin_memory: true
-  target_genes_path: gene_order.tsv
+  target_genes_path: data_info/gene_order.tsv
 
 logging:
   output_dir: output/rtf_only

@@ -21,14 +21,14 @@ echo ""
 # ============================================================================
 
 # 数据路径
-DATA_PATH="/gpfs/hybrid/data/public/PerturBase/drug_perturb.true_time/test/5.link_cells/GSE134839.Erlotinib.link.h5ad"
+DATA_PATH="/gpfs/hybrid/data/public/PerturBase/drug_perturb.true_time/5.link_cells/GSE134839.Erlotinib.link.h5ad"
 
 # 输出目录
-OUTPUT_DIR="output/rtf_only_experiment"
+OUTPUT_DIR="output/rtf_only_experiment_tigon"
 
 # 骨干网络选择: "mlp", "dit", "unet"
 # 注意: UNet 要求基因数能被 2^(depth-1) 整除。对于任意基因数，推荐使用 MLP 或 DiT。
-BACKBONE="DiT" 
+BACKBONE="dit" 
 
 # 训练参数
 BATCH_SIZE=128
