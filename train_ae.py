@@ -3,6 +3,7 @@
 Autoencoder 训练脚本
 """
 
+import os
 import fire
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
@@ -11,6 +12,13 @@ from models.ae import AESystem
 import sys
 import logging
 from datetime import datetime
+
+
+def get_rank() -> int:
+    """Get current process rank in DDP. Returns 0 for non-DDP."""
+    # PyTorch DDP sets these environment variables
+    rank = os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or "0"
+    return int(rank)
 
 
 def setup_logging(output_dir: Path, debug: bool = False, rank: int = 0):
@@ -121,8 +129,9 @@ def train(
     output_dir = Path(cfg.logging.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Note: rank is 0 here, will be updated in setup if using DDP
-    debug_log, train_log = setup_logging(output_dir, debug=debug_mode, rank=0)
+    # Get actual rank for DDP (only rank 0 logs to console)
+    rank = get_rank()
+    debug_log, train_log = setup_logging(output_dir, debug=debug_mode, rank=rank)
 
     logging.info("=" * 80)
     logging.info("Training Configuration:")

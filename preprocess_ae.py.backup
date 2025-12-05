@@ -1,0 +1,275 @@
+import argparse
+import logging
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import pyarrow as pa
+import pyarrow.parquet as pq
+from tqdm import tqdm
+import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+import shutil
+import json
+import gc
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Global variable for workers
+shared_target_genes = None
+
+def init_worker(genes):
+    """Initialize worker process with shared target genes."""
+    global shared_target_genes
+    shared_target_genes = genes
+
+def load_gene_vocab(vocab_path):
+    """Load gene vocabulary from file."""
+    path = Path(vocab_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Vocabulary file not found: {path}")
+
+    logger.info(f"Loading vocabulary from {path}")
+    with open(path, 'r') as f:
+        genes = [line.strip() for line in f if line.strip()]
+
+    return genes
+
+def process_single_file(args):
+    """
+    Worker task to process a single h5ad file.
+    Returns processed DataFrames.
+    """
+    file_path, is_ood, min_genes, target_sum = args
+
+    global shared_target_genes
+    if shared_target_genes is None:
+        return None
+
+    try:
+        # Read h5ad
+        adata = sc.read_h5ad(file_path)
+
+        # Fix gene matching
+        if "gene_symbols" in adata.var.columns:
+            adata.var_names = adata.var["gene_symbols"].astype(str)
+            adata.var_names_make_unique()
+        else:
+            adata.var_names_make_unique()
+
+        # Filter cells
+        if min_genes > 0:
+            sc.pp.filter_cells(adata, min_genes=min_genes)
+
+        if adata.shape[0] == 0:
+            return None
+
+        # Normalize and log1p
+        sc.pp.normalize_total(adata, target_sum=target_sum)
+        sc.pp.log1p(adata)
+
+        # Align genes
+        if hasattr(adata.X, 'toarray'):
+            data = adata.X.toarray()
+        else:
+            data = adata.X
+
+        df = pd.DataFrame(data, index=adata.obs_names, columns=adata.var_names)
+        df = df.astype(np.float32)
+
+        # Reindex to target genes
+        df_aligned = df.reindex(columns=shared_target_genes, fill_value=0.0)
+        df_aligned = df_aligned.astype(np.float32, copy=False)
+
+        if df_aligned.isna().values.any():
+             df_aligned = df_aligned.fillna(0.0)
+
+        # Split into train/val/test
+        if is_ood:
+            return {'ood': df_aligned}
+        else:
+            n_cells = len(df_aligned)
+            indices = np.random.permutation(n_cells)
+
+            n_train = int(n_cells * 0.90)
+            n_val = int(n_cells * 0.05)
+
+            train_idx = indices[:n_train]
+            val_idx = indices[n_train:n_train+n_val]
+            test_idx = indices[n_train+n_val:]
+
+            result = {}
+            if len(train_idx) > 0:
+                result['train'] = df_aligned.iloc[train_idx]
+            if len(val_idx) > 0:
+                result['val'] = df_aligned.iloc[val_idx]
+            if len(test_idx) > 0:
+                result['test'] = df_aligned.iloc[test_idx]
+
+            return result
+
+    except Exception as e:
+        logger.error(f"Error processing {file_path}: {e}")
+        return None
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Preprocess single-cell data to single parquet files")
+    parser.add_argument("--csv_path", type=str, default="data_info/ae_data_info.csv")
+    parser.add_argument("--vocab_path", type=str, default="data_info/gene_order.tsv")
+    parser.add_argument("--output_dir", type=str, default="data/ae_processed")
+    parser.add_argument("--min_genes", type=int, default=200)
+    parser.add_argument("--num_workers", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=500, help="Process files in batches to save memory")
+    parser.add_argument("--seed", type=int, default=42)
+
+    args = parser.parse_args()
+
+    np.random.seed(args.seed)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load vocabulary
+    target_genes = load_gene_vocab(args.vocab_path)
+    logger.info(f"Target vocabulary size: {len(target_genes)}")
+
+    # Load CSV
+    if not Path(args.csv_path).exists():
+        raise FileNotFoundError(f"CSV file not found: {args.csv_path}")
+
+    info_df = pd.read_csv(args.csv_path)
+    logger.info(f"Found {len(info_df)} files in CSV")
+
+    # Prepare tasks
+    tasks = []
+    for idx, row in info_df.iterrows():
+        file_path = row['file_path']
+        is_ood = row.get('full_validation_dataset', 0) == 1
+
+        if Path(file_path).exists():
+            tasks.append((file_path, is_ood, args.min_genes, 1e4))
+
+    total_files = len(tasks)
+    logger.info(f"Processing {total_files} files with {args.num_workers} workers in batches of {args.batch_size}...")
+
+    # Collect data by split
+    all_data = {'train': [], 'val': [], 'test': [], 'ood': []}
+
+    num_batches = (total_files + args.batch_size - 1) // args.batch_size
+
+    with tqdm(total=total_files, desc="Processing files") as pbar:
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * args.batch_size
+            end_idx = min(start_idx + args.batch_size, total_files)
+            batch_tasks = tasks[start_idx:end_idx]
+
+            logger.info(f"Batch {batch_idx+1}/{num_batches}: Processing files {start_idx+1}-{end_idx}")
+
+            # Process batch in parallel
+            batch_results = []
+            with ProcessPoolExecutor(max_workers=args.num_workers, initializer=init_worker, initargs=(target_genes,)) as executor:
+                futures = [executor.submit(process_single_file, task) for task in batch_tasks]
+
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result:
+                        batch_results.append(result)
+                    pbar.update(1)
+
+            # Collect results
+            for result in batch_results:
+                for split_name, df in result.items():
+                    all_data[split_name].append(df)
+
+            logger.info(f"Batch {batch_idx+1} completed, current totals:")
+            for split in all_data:
+                logger.info(f"  {split}: {len(all_data[split])} chunks")
+
+            # Clean up batch
+            del batch_results
+            gc.collect()
+
+    # Merge and write each split to a single parquet file
+    logger.info("=" * 80)
+    logger.info("Merging and writing final parquet files...")
+    logger.info("=" * 80)
+
+    total_stats = {}
+
+    for split_name, df_list in all_data.items():
+        if not df_list:
+            logger.info(f"No data for {split_name}")
+            total_stats[split_name] = 0
+            continue
+
+        logger.info(f"Merging {split_name}: {len(df_list)} chunks...")
+
+        # Concatenate all chunks
+        combined_df = pd.concat(df_list, axis=0, ignore_index=True)
+        total_samples = len(combined_df)
+        total_stats[split_name] = total_samples
+
+        logger.info(f"{split_name}: {total_samples:,} total samples")
+
+        # Shuffle
+        logger.info(f"Shuffling {split_name}...")
+        combined_df = combined_df.sample(frac=1.0, random_state=args.seed).reset_index(drop=True)
+
+        # Write to single parquet file
+        output_file = output_dir / f"{split_name}.parquet"
+        logger.info(f"Writing {split_name}.parquet ({total_samples:,} samples)...")
+
+        # Write with good compression
+        table = pa.Table.from_pandas(combined_df)
+        pq.write_table(
+            table,
+            output_file,
+            compression='snappy',
+            use_dictionary=True,
+            write_statistics=True
+        )
+
+        file_size_mb = output_file.stat().st_size / 1024 / 1024
+        logger.info(f"✓ {split_name}.parquet written: {file_size_mb:.1f} MB")
+
+        # Clean up
+        del combined_df, table
+        gc.collect()
+
+    # Save metadata
+    metadata = {
+        'total_samples': total_stats,
+        'n_genes': len(target_genes),
+        'files': {
+            'train': str(output_dir / 'train.parquet') if total_stats.get('train', 0) > 0 else None,
+            'val': str(output_dir / 'val.parquet') if total_stats.get('val', 0) > 0 else None,
+            'test': str(output_dir / 'test.parquet') if total_stats.get('test', 0) > 0 else None,
+            'ood': str(output_dir / 'ood.parquet') if total_stats.get('ood', 0) > 0 else None,
+        }
+    }
+
+    metadata_file = output_dir / "metadata.json"
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+    logger.info("=" * 80)
+    logger.info("Preprocessing COMPLETE!")
+    logger.info(f"Total statistics: {total_stats}")
+    logger.info(f"Output directory: {output_dir}")
+    logger.info("")
+    logger.info("Generated files:")
+    for split, count in total_stats.items():
+        if count > 0:
+            file_path = output_dir / f"{split}.parquet"
+            size_mb = file_path.stat().st_size / 1024 / 1024
+            logger.info(f"  {split}.parquet: {count:,} samples, {size_mb:.1f} MB")
+    logger.info("=" * 80)
+
+if __name__ == "__main__":
+    multiprocessing.set_start_method('fork', force=True)
+    main()

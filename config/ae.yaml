@@ -13,23 +13,29 @@ training:
   weight_decay: 1e-5
   max_epochs: 50
   reconstruction_loss: smooth_l1  # mse / poisson / smooth_l1
-  
+
   scheduler:
     mode: min
     factor: 0.5
     patience: 10
 
 data:
+  # Dataset type: parquet, zarr, or tiledb
+  # - parquet: Streaming from sharded parquet files (good for large datasets)
+  # - tiledb: True lazy loading with sparse arrays (best for very large datasets >10M cells)
   dataset_type: parquet
-  
-  # Paths to processed data (Zarr or Parquet shards)
+
+  # Paths to processed data
+  # For parquet: point to *_shards directories
+  # For tiledb: point to *_tiledb directories
   processed_path:
     train: data/ae_processed/train_shards
     val: data/ae_processed/val_shards
     test: data/ae_processed/test_shards
     ood: data/ae_processed/ood_shards
-    
-  num_workers: 0
+
+  # DataLoader settings
+  num_workers: 4       # Workers for data loading (0 for TileDB recommended)
   pin_memory: true
 
 logging:

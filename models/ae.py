@@ -15,7 +15,11 @@ import logging
 
 # from scimilarity.nn_models import Encoder, Decoder # Removed dependency
 from models.utils import compute_correlation
-from dataset import ParquetDataset, ParquetIterableDataset, ZarrIterableDataset, collate_fn_static
+from dataset import (
+    ParquetDataset, ParquetIterableDataset, ZarrIterableDataset,
+    TileDBDataset, TileDBIterableDataset,
+    collate_fn_static
+)
 
 class MLPBlock(nn.Module):
     """
@@ -173,7 +177,7 @@ class AESystem(pl.LightningModule):
         # Output dir
         self.output_dir = Path(cfg.logging.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.val_dataset = None
         self.ood_dataset = None
     
@@ -266,14 +270,45 @@ class AESystem(pl.LightningModule):
 
                 # Val
                 if val_path.exists():
-                    # Use IterableDataset for val as well to avoid massive RAM usage, but no shuffle
-                    self.val_dataset = ParquetIterableDataset(val_path, verbose=True, shuffle_shards=False, shuffle_rows=False, debug=debug_mode)
+                    # Use IterableDataset for val, equal_length=True to ensure DDP sync
+                    self.val_dataset = ParquetIterableDataset(val_path, verbose=True, shuffle_shards=False, shuffle_rows=False, debug=debug_mode, equal_length=True)
                 else:
                     logging.warning(f"Val data not found: {val_path}")
 
                 # OOD
                 if ood_path.exists():
-                    self.ood_dataset = ParquetIterableDataset(ood_path, verbose=True, shuffle_shards=False, shuffle_rows=False, debug=debug_mode)
+                    self.ood_dataset = ParquetIterableDataset(ood_path, verbose=True, shuffle_shards=False, shuffle_rows=False, debug=debug_mode, equal_length=True)
+
+            elif dataset_type == "tiledb":
+                logging.info("Setting up TileDB datasets (lazy loading mode)...")
+
+                # Train - use TileDBIterableDataset for DDP training
+                if train_path.exists():
+                    logging.info(f"Loading Training Data from {train_path} (TileDB Iterable Mode)...")
+                    self.train_dataset = TileDBIterableDataset(
+                        train_path, verbose=True, shuffle=True, debug=debug_mode, equal_length=True
+                    )
+
+                    # Update n_genes automatically
+                    if self.cfg.model.n_genes != self.train_dataset.n_genes:
+                        logging.info(f"Auto-updating n_genes: {self.cfg.model.n_genes} -> {self.train_dataset.n_genes}")
+                        self.cfg.model.n_genes = self.train_dataset.n_genes
+                else:
+                    raise FileNotFoundError(f"Train data not found: {train_path}")
+
+                # Val - use standard TileDBDataset (lazy loading, one row at a time)
+                if val_path.exists():
+                    logging.info(f"Loading Validation Data from {val_path} (TileDB Dataset Mode)...")
+                    self.val_dataset = TileDBDataset(val_path, verbose=True)
+                else:
+                    logging.warning(f"Val data not found: {val_path}")
+
+                # OOD - use standard TileDBDataset
+                if ood_path.exists():
+                    logging.info(f"Loading OOD Data from {ood_path} (TileDB Dataset Mode)...")
+                    self.ood_dataset = TileDBDataset(ood_path, verbose=True)
+                else:
+                    pass  # No OOD data
 
             else:
                 # Legacy support if needed
@@ -297,41 +332,53 @@ class AESystem(pl.LightningModule):
                 self.reconstruction_loss_fn = self.reconstruction_loss_fn.to(self.device)
     
     def train_dataloader(self):
+        num_workers = self.cfg.data.num_workers
+        # Streaming dataset is memory efficient, safe to use num_workers > 0
         return DataLoader(
             self.train_dataset,
             batch_size=self.cfg.training.batch_size,
-            shuffle=False, # Shuffle handled internally by IterableDataset
-            num_workers=self.cfg.data.num_workers,
+            shuffle=False,  # Shuffle handled internally by IterableDataset
+            num_workers=num_workers,
             pin_memory=self.cfg.data.pin_memory,
             collate_fn=collate_fn_static,
-            drop_last=True, # Drop incomplete batches to avoid DDP deadlocks
+            drop_last=True,  # Drop incomplete batches to avoid DDP deadlocks
+            persistent_workers=num_workers > 0,  # Keep workers alive between epochs
+            prefetch_factor=4 if num_workers > 0 else None,  # Prefetch more batches
         )
-    
+
     def val_dataloader(self):
-        if not self.val_dataset: 
-            return [] 
+        if not self.val_dataset:
+            return []
+        # Use smaller batch and drop_last=False to ensure we get val_loss
+        val_batch = min(self.cfg.training.batch_size, 1024)
+
         return DataLoader(
             self.val_dataset,
-            batch_size=self.cfg.training.batch_size,
+            batch_size=val_batch,
             shuffle=False,
-            num_workers=self.cfg.data.num_workers,
+            num_workers=0,  # Single process for validation
             pin_memory=self.cfg.data.pin_memory,
             collate_fn=collate_fn_static,
-            drop_last=True, # Consistent behavior
+            drop_last=False,  # Don't drop - we need val_loss even with small data
         )
-    
+
     def test_dataloader(self):
         """OOD Validation"""
-        if not self.ood_dataset: return []
+        if not self.ood_dataset:
+            return []
+        # Use smaller batch and drop_last=False
+        test_batch = min(self.cfg.training.batch_size, 1024)
+
         return DataLoader(
             self.ood_dataset,
-            batch_size=self.cfg.training.batch_size,
+            batch_size=test_batch,
             shuffle=False,
-            num_workers=self.cfg.data.num_workers,
+            num_workers=0,  # Single process for OOD
             pin_memory=self.cfg.data.pin_memory,
             collate_fn=collate_fn_static,
+            drop_last=False,  # Don't drop - we need test metrics
         )
-    
+
     def training_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
         x = batch
         x_reconstructed, latent = self.forward(x)

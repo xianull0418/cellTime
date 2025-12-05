@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import math
 import logging
+import gc
 
 try:
     import zarr
@@ -291,15 +292,24 @@ class ParquetIterableDataset(IterableDataset):
     """
     Iterative Parquet Dataset for efficient training on large sharded datasets.
     Avoids random access overhead by reading full shards and shuffling in memory.
+
+    DDP Support:
+    - Files are split among ranks (GPUs) using round-robin
+    - Each rank's files are further split among DataLoader workers
+    - Use `equal_length=True` to ensure all ranks produce the same number of samples
+      (required to avoid DDP deadlocks when file sizes are uneven)
     """
-    def __init__(self, path: Union[str, Path], verbose: bool = False, shuffle_shards: bool = True, shuffle_rows: bool = True, debug: bool = False):
+    def __init__(self, path: Union[str, Path], verbose: bool = False, shuffle_shards: bool = True,
+                 shuffle_rows: bool = True, debug: bool = False, equal_length: bool = True):
         self.path = Path(path)
         self.verbose = verbose
         self.shuffle_shards = shuffle_shards
         self.shuffle_rows = shuffle_rows
-        self.debug = debug  # Add debug flag
+        self.debug = debug
+        self.equal_length = equal_length  # Ensure all ranks produce equal samples for DDP
         self.files = []
-        
+        self.shard_lengths = None  # Will be populated from cache if available
+
         if self.path.is_dir():
             self.files = sorted(list(self.path.glob("*.parquet")))
             if not self.files:
@@ -312,16 +322,13 @@ class ParquetIterableDataset(IterableDataset):
              raise FileNotFoundError(f"Path not found: {self.path}")
 
         # Read metadata from first file to get n_genes
-        # We don't need total length for IterableDataset usually, but good to have estimate
-        # We skip full metadata scan for speed unless cached
         try:
             import pyarrow.parquet as pq
-            # Use read_table with slice to accurately determine columns (excluding index via to_pandas)
             sample = pq.read_table(self.files[0]).slice(0, 1)
             self.n_genes = sample.to_pandas().shape[1]
-            self.n_cells = 0 # Unknown unless scanned
-            
-             # Cache check for n_cells (optional but helpful for logging)
+            self.n_cells = 0
+
+            # Cache check for n_cells and shard_lengths (critical for equal_length mode)
             cache_file = self.path / "metadata_cache.json" if self.path.is_dir() else None
             if cache_file and cache_file.exists():
                 try:
@@ -329,13 +336,30 @@ class ParquetIterableDataset(IterableDataset):
                         cache = json.load(f)
                     if cache.get('n_files') == len(self.files):
                         self.n_cells = cache['n_cells']
+                        self.shard_lengths = cache.get('shard_lengths', None)
+                        if self.shard_lengths:
+                            self.shard_lengths = {str(f): l for f, l in zip(self.files, self.shard_lengths)}
                 except: pass
-            
+
         except Exception as e:
             raise RuntimeError(f"Failed to initialize ParquetIterableDataset: {e}")
 
+    def _compute_target_samples_per_rank(self, world_size: int, num_workers: int) -> int:
+        """
+        Compute the target number of samples each rank should produce for equal_length mode.
+        This ensures all ranks produce exactly the same number of samples to avoid DDP deadlock.
+        """
+        if self.n_cells <= 0:
+            return 0
+
+        # Each rank should produce ceil(n_cells / world_size) samples
+        # This ensures we don't lose data, and all ranks produce the same amount
+        samples_per_rank = int(math.ceil(self.n_cells / world_size))
+        return samples_per_rank
+
     def __iter__(self):
         import torch.distributed as dist
+        import pyarrow.parquet as pq
 
         # 1. Global Split (per Rank/GPU)
         if dist.is_available() and dist.is_initialized():
@@ -345,75 +369,292 @@ class ParquetIterableDataset(IterableDataset):
             rank = 0
             world_size = 1
 
-        # Split files among ranks using Round Robin to ensure balance
-        # Old: Block split caused imbalance (last rank has much fewer files)
-        # my_files = self.files[rank_start:rank_end]
-        my_files = self.files[rank::world_size]
-
         # 2. Local Split (per Worker)
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info is not None else 0
         num_workers = worker_info.num_workers if worker_info is not None else 1
 
-        if worker_info is None:  # Single-process data loading
-            pass
-        else:  # Worker split
-            # Split files among workers using Round Robin
+        # Compute target samples for equal_length mode
+        target_samples_per_rank = self._compute_target_samples_per_rank(world_size, num_workers) if self.equal_length else 0
+        target_samples_per_worker = int(math.ceil(target_samples_per_rank / num_workers)) if target_samples_per_rank > 0 else 0
+
+        if self.debug and self.equal_length and target_samples_per_worker > 0:
+            logging.debug(f"[Rank {rank} Worker {worker_id}] equal_length mode: target {target_samples_per_worker:,} samples/worker")
+
+        # Special handling for edge cases
+        if len(self.files) == 1:
+            yield from self._iter_single_file(rank, world_size, worker_id, num_workers, target_samples_per_worker)
+            return
+
+        if len(self.files) < world_size:
+            if self.debug or self.verbose:
+                logging.debug(f"[Rank {rank}] Files ({len(self.files)}) < ranks ({world_size}), using row-based split")
+            yield from self._iter_few_files(rank, world_size, worker_id, num_workers, target_samples_per_worker)
+            return
+
+        # Multi-file handling: Split files among ranks and workers
+        my_files = self.files[rank::world_size]
+        if worker_info is not None:
             my_files = my_files[worker_id::num_workers]
 
-        # DEBUG: Print file distribution
         if self.debug or self.verbose:
             logging.debug(f"[Rank {rank}/{world_size} Worker {worker_id}/{num_workers}] "
                          f"Processing {len(my_files)}/{len(self.files)} files from {self.path.name}")
 
         if self.shuffle_shards:
+            my_files = list(my_files)
             np.random.shuffle(my_files)
 
-        import pyarrow.parquet as pq
-
         total_samples_yielded = 0
-        for shard_idx, fpath in enumerate(my_files):
+        all_samples_buffer = []
+
+        show_progress = (rank == 0 and worker_id == 0)
+        file_iter = tqdm(enumerate(my_files), total=len(my_files),
+                        desc=f"Loading {self.path.name}",
+                        disable=not show_progress,
+                        unit="shard")
+
+        # Smaller batch to reduce memory usage
+        # 5000 rows × 19331 genes × 4 bytes ≈ 370 MB per batch
+        BATCH_SIZE = 5000
+
+        for shard_idx, fpath in file_iter:
             try:
-                if self.debug:
-                    logging.debug(f"[Rank {rank} Worker {worker_id}] Reading shard {shard_idx+1}/{len(my_files)}: {fpath.name}")
+                parquet_file = pq.ParquetFile(fpath)
 
-                # Optimized read: Read full shard table once, then iterate
-                # This is much faster than random access or repeated reads
-                table = pq.read_table(fpath)
+                for batch in parquet_file.iter_batches(batch_size=BATCH_SIZE):
+                    # Fast path: Arrow -> NumPy directly (skip pandas)
+                    # Combine all columns into a single array
+                    arrays = [col.to_numpy(zero_copy_only=False) for col in batch.columns]
+                    batch_data = np.column_stack(arrays).astype(np.float32, copy=False)
+                    n_rows = len(batch_data)
 
-                # Convert directly to float32 numpy array
-                # Use pandas as intermediary which is robust for mixed types (though we expect float)
-                # copy=False tries to avoid data duplication
-                data = table.to_pandas().to_numpy(dtype=np.float32, copy=False)
+                    # Pre-convert entire batch to tensor (faster than per-row)
+                    batch_tensor = torch.from_numpy(batch_data)
+                    del batch_data, arrays
 
-                # Explicit cleanup
-                del table
+                    indices = np.arange(n_rows)
+                    if self.shuffle_rows:
+                        np.random.shuffle(indices)
 
-                n_rows = len(data)
-                indices = np.arange(n_rows)
+                    for idx in indices:
+                        sample = batch_tensor[idx]
+                        yield sample
+                        total_samples_yielded += 1
 
-                if self.shuffle_rows:
-                    np.random.shuffle(indices)
+                        if self.equal_length and target_samples_per_worker > 0:
+                            if len(all_samples_buffer) < min(1000, target_samples_per_worker):
+                                all_samples_buffer.append(sample.clone())
 
-                for idx in indices:
-                    yield torch.from_numpy(data[idx])
-                    total_samples_yielded += 1
+                        if self.equal_length and target_samples_per_worker > 0 and total_samples_yielded >= target_samples_per_worker:
+                            return
 
-                # Cleanup after each shard
-                del data
+                    del batch_tensor
 
-                if self.debug:
-                    logging.debug(f"[Rank {rank} Worker {worker_id}] Completed shard {shard_idx+1}/{len(my_files)}, "
-                                 f"total samples yielded: {total_samples_yielded}")
+                if show_progress:
+                    file_iter.set_postfix(samples=f"{total_samples_yielded:,}")
 
             except Exception as e:
                 logging.error(f"[Rank {rank} Worker {worker_id}] Error reading shard {fpath}: {e}")
                 continue
 
-        # DEBUG: Mark completion
+        # Padding for equal_length mode
+        if self.equal_length and target_samples_per_worker > 0 and total_samples_yielded < target_samples_per_worker:
+            if all_samples_buffer:
+                buffer_idx = 0
+                while total_samples_yielded < target_samples_per_worker:
+                    yield all_samples_buffer[buffer_idx % len(all_samples_buffer)]
+                    total_samples_yielded += 1
+                    buffer_idx += 1
+
         if self.debug or self.verbose:
-            logging.debug(f"[Rank {rank} Worker {worker_id}] COMPLETED iteration, "
-                         f"total samples: {total_samples_yielded}")
+            logging.debug(f"[Rank {rank} Worker {worker_id}] COMPLETED iteration, total samples: {total_samples_yielded}")
+
+    def _iter_single_file(self, rank: int, world_size: int, worker_id: int, num_workers: int, target_samples_per_worker: int):
+        """Handle iteration for single-file datasets by splitting rows using streaming."""
+        import pyarrow.parquet as pq
+
+        show_progress = (rank == 0 and worker_id == 0)
+
+        if show_progress:
+            print(f"Loading single file: {self.files[0].name}...")
+
+        parquet_file = pq.ParquetFile(self.files[0])
+        total_rows = parquet_file.metadata.num_rows
+
+        # Calculate row range for this rank and worker
+        rows_per_rank = total_rows // world_size
+        start_idx = rank * rows_per_rank
+        end_idx = total_rows if rank == world_size - 1 else start_idx + rows_per_rank
+
+        rank_rows = end_idx - start_idx
+        rows_per_worker = rank_rows // num_workers if num_workers > 1 else rank_rows
+        worker_start = start_idx + worker_id * rows_per_worker
+        worker_end = end_idx if worker_id == num_workers - 1 else worker_start + rows_per_worker
+
+        if self.debug or self.verbose:
+            logging.debug(f"[Rank {rank} Worker {worker_id}] Processing rows {worker_start:,}-{worker_end:,}")
+
+        total_samples_yielded = 0
+        current_row = 0
+        BATCH_SIZE = 5000  # ~370 MB per batch
+
+        row_iter = tqdm(range(worker_end - worker_start),
+                       desc=f"Processing {self.path.name}",
+                       disable=not show_progress,
+                       unit="sample")
+
+        for batch in parquet_file.iter_batches(batch_size=BATCH_SIZE):
+            batch_start = current_row
+            batch_len = batch.num_rows
+            batch_end = current_row + batch_len
+
+            if batch_end <= worker_start:
+                current_row = batch_end
+                continue
+            if batch_start >= worker_end:
+                break
+
+            # Fast Arrow -> NumPy -> Tensor conversion
+            arrays = [col.to_numpy(zero_copy_only=False) for col in batch.columns]
+            batch_data = np.column_stack(arrays).astype(np.float32, copy=False)
+            batch_tensor = torch.from_numpy(batch_data)
+            del batch_data, arrays
+
+            # Calculate overlap
+            local_start = max(0, worker_start - batch_start)
+            local_end = min(batch_len, worker_end - batch_start)
+
+            indices = np.arange(local_start, local_end)
+            if self.shuffle_rows:
+                np.random.shuffle(indices)
+
+            for idx in indices:
+                yield batch_tensor[idx]
+                total_samples_yielded += 1
+                row_iter.update(1)
+
+                if self.equal_length and target_samples_per_worker > 0 and total_samples_yielded >= target_samples_per_worker:
+                    del batch_tensor
+                    row_iter.close()
+                    return
+
+            current_row = batch_end
+            del batch_tensor
+
+        row_iter.close()
+
+        if self.debug or self.verbose:
+            logging.debug(f"[Rank {rank} Worker {worker_id}] COMPLETED iteration, total samples: {total_samples_yielded:,}")
+
+    def _iter_few_files(self, rank: int, world_size: int, worker_id: int, num_workers: int, target_samples_per_worker: int):
+        """
+        Handle iteration when files < ranks by streaming through all files and splitting by rows.
+        Memory efficient: processes one batch at a time.
+        """
+        import pyarrow.parquet as pq
+
+        show_progress = (rank == 0 and worker_id == 0)
+
+        # First pass: count total rows (lightweight metadata reads)
+        total_rows = 0
+        file_row_counts = []
+        for fpath in self.files:
+            try:
+                pf = pq.ParquetFile(fpath)
+                count = pf.metadata.num_rows
+                file_row_counts.append((fpath, count))
+                total_rows += count
+            except Exception as e:
+                logging.error(f"[Rank {rank} Worker {worker_id}] Error reading metadata {fpath}: {e}")
+
+        if total_rows == 0:
+            return
+
+        # Calculate row range for this rank and worker
+        rows_per_rank = total_rows // world_size
+        start_idx = rank * rows_per_rank
+        end_idx = total_rows if rank == world_size - 1 else start_idx + rows_per_rank
+
+        rank_rows = end_idx - start_idx
+        if rank_rows > 0 and num_workers > 1:
+            rows_per_worker = rank_rows // num_workers
+            worker_start = start_idx + worker_id * rows_per_worker
+            worker_end = end_idx if worker_id == num_workers - 1 else worker_start + rows_per_worker
+        else:
+            worker_start = start_idx
+            worker_end = end_idx
+
+        if self.debug or self.verbose:
+            logging.debug(f"[Rank {rank} Worker {worker_id}] Processing rows {worker_start:,}-{worker_end:,}")
+
+        total_samples_yielded = 0
+        global_row = 0
+        BATCH_SIZE = 5000  # ~370 MB per batch
+
+        row_iter = tqdm(range(worker_end - worker_start),
+                       desc=f"Processing {self.path.name}",
+                       disable=not show_progress,
+                       unit="sample")
+
+        for fpath, file_rows in file_row_counts:
+            file_start = global_row
+            file_end = global_row + file_rows
+
+            if file_end <= worker_start:
+                global_row = file_end
+                continue
+            if file_start >= worker_end:
+                break
+
+            try:
+                parquet_file = pq.ParquetFile(fpath)
+
+                for batch in parquet_file.iter_batches(batch_size=BATCH_SIZE):
+                    batch_start = global_row
+                    batch_len = batch.num_rows
+                    batch_end = global_row + batch_len
+
+                    if batch_end <= worker_start:
+                        global_row = batch_end
+                        continue
+                    if batch_start >= worker_end:
+                        break
+
+                    # Fast Arrow -> NumPy -> Tensor conversion
+                    arrays = [col.to_numpy(zero_copy_only=False) for col in batch.columns]
+                    batch_data = np.column_stack(arrays).astype(np.float32, copy=False)
+                    batch_tensor = torch.from_numpy(batch_data)
+                    del batch_data, arrays
+
+                    local_start = max(0, worker_start - batch_start)
+                    local_end = min(batch_len, worker_end - batch_start)
+
+                    indices = np.arange(local_start, local_end)
+                    if self.shuffle_rows:
+                        np.random.shuffle(indices)
+
+                    for idx in indices:
+                        yield batch_tensor[idx]
+                        total_samples_yielded += 1
+                        row_iter.update(1)
+
+                        if self.equal_length and target_samples_per_worker > 0 and total_samples_yielded >= target_samples_per_worker:
+                            del batch_tensor
+                            row_iter.close()
+                            return
+
+                    global_row = batch_end
+                    del batch_tensor
+
+            except Exception as e:
+                logging.error(f"[Rank {rank} Worker {worker_id}] Error streaming {fpath}: {e}")
+                global_row = file_end
+
+        row_iter.close()
+
+        if self.debug or self.verbose:
+            logging.debug(f"[Rank {rank} Worker {worker_id}] COMPLETED few_files iteration, total samples: {total_samples_yielded:,}")
 
     # Re-added __len__ for progress bar, but safeguard against 0
     def __len__(self):
@@ -445,7 +686,7 @@ class ZarrIterableDataset(IterableDataset):
         self.shuffle_shards = shuffle_shards
         self.shuffle_rows = shuffle_rows
         self.debug = debug  # Add debug flag
-        
+
         if zarr is None:
             raise ImportError("Please install zarr: pip install zarr")
 
@@ -486,9 +727,9 @@ class ZarrIterableDataset(IterableDataset):
                 # Try to find array directly if not in group 'X' (unlikely for anndata structure)
                 # Assuming structure is root -> X
                 raise ValueError("Zarr store must contain 'X' array/group")
-            
+
             self.n_cells = 0 # Unknown unless scanned
-            
+
             # Cache check
             cache_file = self.path / "metadata_cache_zarr.json" if self.path.is_dir() else None
             if cache_file and cache_file.exists():
@@ -498,7 +739,7 @@ class ZarrIterableDataset(IterableDataset):
                     if cache.get('n_files') == len(self.files):
                         self.n_cells = cache['n_cells']
                 except: pass
-                
+
         except Exception as e:
             raise RuntimeError(f"Failed to initialize ZarrIterableDataset: {e}")
 
@@ -534,10 +775,11 @@ class ZarrIterableDataset(IterableDataset):
             np.random.shuffle(my_files)
 
         total_samples_yielded = 0
+        total_files = len(self.files)  # Store total file count for consistent logging
         for shard_idx, fpath in enumerate(my_files):
             try:
                 if self.debug:
-                    logging.debug(f"[Rank {rank} Worker {worker_id}] Reading Zarr shard {shard_idx+1}/{len(my_files)}: {fpath.name}")
+                    logging.debug(f"[Rank {rank} Worker {worker_id}] Reading Zarr shard {shard_idx+1}/{len(my_files)} (assigned), {total_files} total: {fpath.name}")
 
                 store = zarr.open_group(str(fpath), mode='r')
                 # Assume X is the data
@@ -602,6 +844,313 @@ class ZarrIterableDataset(IterableDataset):
                 world_size = dist.get_world_size()
             return int(math.ceil(self.n_cells / world_size))
         return 1000000 # Fallback
+
+
+class TileDBDataset(Dataset):
+    """
+    TileDB Dataset for efficient random access training (like scimilarity).
+
+    Uses TileDB sparse arrays for lazy loading - only reads data when accessed.
+    This is the most memory-efficient approach for large datasets.
+
+    TileDB Structure (CellArr-style):
+    - counts/: Sparse matrix (cell_index, gene_index) -> value
+    - cell_metadata/: Cell metadata
+    - gene_annotation/: Gene info
+
+    Usage:
+        dataset = TileDBDataset("data/train_tiledb")
+        # Data is NOT loaded until __getitem__ is called
+        sample = dataset[0]  # Reads only this row from TileDB
+    """
+
+    def __init__(
+        self,
+        path: Union[str, Path],
+        verbose: bool = False,
+        lognorm: bool = False,  # Data is already log-normalized from preprocessing
+        target_sum: float = 1e4,
+    ):
+        try:
+            import tiledb
+            self.tiledb = tiledb
+        except ImportError:
+            raise ImportError("TileDB not installed. Run: pip install tiledb")
+
+        self.path = Path(path)
+        self.verbose = verbose
+        self.lognorm = lognorm
+        self.target_sum = target_sum
+
+        if not self.path.exists():
+            raise FileNotFoundError(f"TileDB path not found: {self.path}")
+
+        # Load metadata
+        metadata_file = self.path / "metadata.json"
+        if metadata_file.exists():
+            with open(metadata_file, 'r') as f:
+                self.metadata = json.load(f)
+            self.n_cells = self.metadata['n_cells']
+            self.n_genes = self.metadata['n_genes']
+        else:
+            raise FileNotFoundError(f"TileDB metadata not found: {metadata_file}")
+
+        # Configure TileDB for single-threaded access (better for DataLoader workers)
+        self.cfg = tiledb.Config({
+            "sm.compute_concurrency_level": 1,
+            "sm.io_concurrency_level": 1,
+        })
+
+        # Open counts TileDB (will be used for random access)
+        counts_uri = str(self.path / "counts")
+        self.counts_tdb = tiledb.open(counts_uri, 'r', config=self.cfg)
+
+        if verbose:
+            print(f"TileDB Dataset: {self.path}")
+            print(f"  Cells: {self.n_cells:,}, Genes: {self.n_genes:,}")
+            print(f"  Sparsity: {self.metadata.get('sparsity', 'N/A')}")
+
+    def __len__(self):
+        return self.n_cells
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        """
+        Get a single cell's expression vector.
+        This is the key lazy-loading method - only reads one row from TileDB.
+        """
+        # Query TileDB for this cell's data
+        results = self.counts_tdb.multi_index[idx, :]
+
+        # Reconstruct dense vector from sparse data
+        gene_indices = results['gene_index']
+        values = results['data']
+
+        # Create dense vector
+        x = np.zeros(self.n_genes, dtype=np.float32)
+        if len(gene_indices) > 0:
+            x[gene_indices] = values
+
+        return torch.from_numpy(x)
+
+    def __del__(self):
+        if hasattr(self, 'counts_tdb'):
+            self.counts_tdb.close()
+
+
+class TileDBCollator:
+    """
+    Collator that fetches data from TileDB in batches.
+    More efficient than single-row access for training.
+
+    Usage:
+        collator = TileDBCollator("data/train_tiledb")
+        dataloader = DataLoader(dataset, collate_fn=collator)
+    """
+
+    def __init__(
+        self,
+        tiledb_path: Union[str, Path],
+        lognorm: bool = False,
+        target_sum: float = 1e4,
+    ):
+        try:
+            import tiledb
+            self.tiledb = tiledb
+        except ImportError:
+            raise ImportError("TileDB not installed. Run: pip install tiledb")
+
+        self.path = Path(tiledb_path)
+        self.lognorm = lognorm
+        self.target_sum = target_sum
+
+        # Load metadata
+        with open(self.path / "metadata.json", 'r') as f:
+            self.metadata = json.load(f)
+        self.n_genes = self.metadata['n_genes']
+
+        # Configure TileDB
+        self.cfg = tiledb.Config({
+            "sm.mem.total_budget": 10000000000,  # 10GB
+            "sm.compute_concurrency_level": 1,
+            "sm.io_concurrency_level": 1,
+        })
+
+        # Open counts TileDB
+        counts_uri = str(self.path / "counts")
+        self.counts_tdb = tiledb.open(counts_uri, 'r', config=self.cfg)
+
+    def __call__(self, batch_indices: list) -> torch.Tensor:
+        """
+        Collate a batch of cell indices into a tensor.
+        Fetches all cells in one TileDB query (efficient!).
+        """
+        from scipy.sparse import coo_matrix
+
+        # Batch query TileDB
+        cell_indices = list(batch_indices)
+        results = self.counts_tdb.multi_index[cell_indices, :]
+
+        # Build sparse matrix from results
+        n_cells = len(cell_indices)
+        cell_idx_map = {orig: new for new, orig in enumerate(cell_indices)}
+
+        # Map original cell indices to batch indices
+        batch_cell_indices = np.array([cell_idx_map[c] for c in results['cell_index']])
+        gene_indices = results['gene_index']
+        values = results['data']
+
+        # Create sparse matrix and convert to dense
+        sparse_mat = coo_matrix(
+            (values, (batch_cell_indices, gene_indices)),
+            shape=(n_cells, self.n_genes)
+        ).tocsr()
+
+        # Convert to dense tensor
+        X = torch.from_numpy(sparse_mat.toarray().astype(np.float32))
+
+        return X
+
+    def __del__(self):
+        if hasattr(self, 'counts_tdb'):
+            self.counts_tdb.close()
+
+
+class TileDBIterableDataset(IterableDataset):
+    """
+    Iterable TileDB Dataset for DDP training.
+
+    Combines the efficiency of TileDB with IterableDataset for distributed training.
+    Each rank/worker gets a subset of cell indices, and data is loaded lazily.
+    """
+
+    def __init__(
+        self,
+        path: Union[str, Path],
+        verbose: bool = False,
+        shuffle: bool = True,
+        debug: bool = False,
+        equal_length: bool = True,
+        batch_size: int = 1000,  # Read this many cells at once from TileDB
+    ):
+        try:
+            import tiledb
+            self.tiledb = tiledb
+        except ImportError:
+            raise ImportError("TileDB not installed. Run: pip install tiledb")
+
+        self.path = Path(path)
+        self.verbose = verbose
+        self.shuffle = shuffle
+        self.debug = debug
+        self.equal_length = equal_length
+        self.batch_size = batch_size
+
+        if not self.path.exists():
+            raise FileNotFoundError(f"TileDB path not found: {self.path}")
+
+        # Load metadata
+        with open(self.path / "metadata.json", 'r') as f:
+            self.metadata = json.load(f)
+        self.n_cells = self.metadata['n_cells']
+        self.n_genes = self.metadata['n_genes']
+
+        if verbose:
+            print(f"TileDB Iterable Dataset: {self.path}")
+            print(f"  Cells: {self.n_cells:,}, Genes: {self.n_genes:,}")
+
+    def __iter__(self):
+        import torch.distributed as dist
+        from scipy.sparse import coo_matrix
+
+        # Get rank and world size
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
+
+        # Get worker info
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+
+        # Calculate cell range for this rank and worker
+        cells_per_rank = self.n_cells // world_size
+        rank_start = rank * cells_per_rank
+        rank_end = self.n_cells if rank == world_size - 1 else rank_start + cells_per_rank
+
+        rank_cells = rank_end - rank_start
+        cells_per_worker = rank_cells // num_workers
+        worker_start = rank_start + worker_id * cells_per_worker
+        worker_end = rank_end if worker_id == num_workers - 1 else worker_start + cells_per_worker
+
+        # Generate indices
+        indices = np.arange(worker_start, worker_end)
+        if self.shuffle:
+            np.random.shuffle(indices)
+
+        if self.debug or self.verbose:
+            logging.debug(f"[Rank {rank} Worker {worker_id}] TileDB cells {worker_start}-{worker_end} ({len(indices):,} cells)")
+
+        # Open TileDB
+        cfg = self.tiledb.Config({
+            "sm.compute_concurrency_level": 1,
+            "sm.io_concurrency_level": 1,
+        })
+        counts_tdb = self.tiledb.open(str(self.path / "counts"), 'r', config=cfg)
+
+        try:
+            total_yielded = 0
+            show_progress = (rank == 0 and worker_id == 0)
+
+            # Process in batches for efficiency
+            for batch_start in tqdm(range(0, len(indices), self.batch_size),
+                                    desc=f"Loading TileDB",
+                                    disable=not show_progress,
+                                    unit="batch"):
+                batch_end = min(batch_start + self.batch_size, len(indices))
+                batch_indices = indices[batch_start:batch_end].tolist()
+
+                # Batch query TileDB
+                results = counts_tdb.multi_index[batch_indices, :]
+
+                # Build batch data
+                n_batch = len(batch_indices)
+                idx_map = {orig: new for new, orig in enumerate(batch_indices)}
+
+                if len(results['cell_index']) > 0:
+                    batch_cell_idx = np.array([idx_map[c] for c in results['cell_index']])
+                    gene_idx = results['gene_index']
+                    values = results['data']
+
+                    sparse_mat = coo_matrix(
+                        (values, (batch_cell_idx, gene_idx)),
+                        shape=(n_batch, self.n_genes)
+                    ).tocsr()
+                    batch_data = sparse_mat.toarray().astype(np.float32)
+                else:
+                    batch_data = np.zeros((n_batch, self.n_genes), dtype=np.float32)
+
+                # Yield samples
+                for i in range(n_batch):
+                    yield torch.from_numpy(batch_data[i])
+                    total_yielded += 1
+
+                del batch_data
+
+            if self.debug or self.verbose:
+                logging.debug(f"[Rank {rank} Worker {worker_id}] TileDB iteration complete, {total_yielded:,} samples")
+
+        finally:
+            counts_tdb.close()
+
+    def __len__(self):
+        import torch.distributed as dist
+        world_size = 1
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+        return int(math.ceil(self.n_cells / world_size))
 
 
 # Alias for backward compatibility if needed, or use ParquetDataset directly
