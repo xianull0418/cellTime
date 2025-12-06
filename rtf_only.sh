@@ -24,7 +24,7 @@ echo ""
 DATA_PATH="/gpfs/hybrid/data/public/PerturBase/drug_perturb.true_time/5.link_cells/GSE134839.Erlotinib.link.h5ad"
 
 # 输出目录
-OUTPUT_DIR="output/rtf_only_experiment_tigon"
+OUTPUT_DIR="output/rtf_only_experiment_tigon_inversion"
 
 # 骨干网络选择: "mlp", "dit", "unet"
 # 注意: UNet 要求基因数能被 2^(depth-1) 整除。对于任意基因数，推荐使用 MLP 或 DiT。
@@ -52,9 +52,12 @@ python train_rtf_only.py \
   --config_path=config/rtf_only.yaml \
   --data_path="$DATA_PATH" \
   --model__backbone="$BACKBONE" \
+  --model__mode="inversion" \
   --training__batch_size=$BATCH_SIZE \
   --training__max_epochs=$MAX_EPOCHS \
   --training__learning_rate=$LEARNING_RATE \
+  --training__use_consistency=false \
+  --training__consistency_weight=0.1 \
   --logging__output_dir="$OUTPUT_DIR"
 
 echo ""

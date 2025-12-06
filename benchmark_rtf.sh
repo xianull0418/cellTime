@@ -15,13 +15,13 @@ cd "$SCRIPT_DIR"
 # ============================================================================
 
 # 模型检查点路径（必须指定）
-CKPT_PATH="${1:-output/rtf_only_experiment_cellrank/checkpoints/last.ckpt}"
+CKPT_PATH="${1:-output/rtf_only_experiment_tigon_inversion/checkpoints/last.ckpt}"
 
 # 数据路径（可选，默认使用训练时的数据路径）
 DATA_PATH="${2:-}"
 
 # 输出目录
-OUTPUT_DIR="${3:-benchmarks/results/rtf_only_cellrank}"
+OUTPUT_DIR="${3:-benchmarks/results/rtf_only_tigon_inversion}"
 
 # 评估参数
 BATCH_SIZE=100

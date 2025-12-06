@@ -1,0 +1,73 @@
+# ==========================
+# 1. 核心数据与模型 (绝对不能传)
+# ==========================
+# 数据集目录 (通常很大)
+
+raw_data/
+processed_data/
+
+# 模型权重文件 (PyTorch / TensorFlow / Keras)
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.onnx
+*.safetensors
+checkpoints/
+saved_models/
+
+# ==========================
+# 2. 训练日志与输出
+# ==========================
+# TensorBoard 日志
+runs/
+logs/
+tensorboard/
+
+# Weights & Biases (WandB) 本地缓存
+wandb/
+
+# Hydra (如果你用 OmegaConf/Hydra) 自动生成的输出
+outputs/
+multirun/
+
+# 其他实验结果
+results/
+experiments/
+*.csv  # 除非是极小的配置文件，否则不建议传结果 CSV
+
+# ==========================
+# 3. Python 环境与缓存 (标准配置)
+# ==========================
+# 字节码缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境 (根据你的命名习惯)
+venv/
+.venv/
+env/
+.env/
+.conda/
+
+# ==========================
+# 4. IDE 与 系统文件
+# ==========================
+# Jupyter Notebook 检查点
+.ipynb_checkpoints/
+
+# VS Code / PyCharm 配置
+.vscode/
+.idea/
+
+# Mac 系统文件
+.DS_Store
+
+# ==========================
+# 5. 敏感信息
+# ==========================
+# 环境变量文件 (包含 API Keys)
+.env
+api_keys.txt
+secrets.json

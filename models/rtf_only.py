@@ -232,7 +232,13 @@ class RFInversionOnly(nn.Module):
     ) -> tuple:
         """
         计算 Inversion 模式的损失
-        训练两个方向：x1->noise 和 x2->noise
+        训练两个方向：x1->noise 和 x2->noise（与 rtf.py 一致）
+
+        训练方向：data -> noise
+        - 插值：x_t = (1-t) * data + t * noise
+        - t=0 时 x_t = data
+        - t=1 时 x_t = noise
+        - 速度场：v = noise - data（指向 noise）
 
         Args:
             x1: 起点 [B, n_genes]
@@ -249,27 +255,36 @@ class RFInversionOnly(nn.Module):
         t = self.sample_timestep(batch_size, device)
         t_exp = t.view(batch_size, *([1] * (x1.ndim - 1)))
 
-        # 方向 1：x1 -> noise
-        noise1 = torch.randn_like(x1)
+        # 使用共享的 noise（同一轨迹的细胞共享"内在身份"）
+        # 关键：将 noise 缩放到与 data 相同的尺度
+        shared_noise = torch.randn_like(x1)
         if self.normalize:
-            noise1 = F.normalize(noise1, p=2, dim=1)
-        x_t1 = (1 - t_exp) * x1 + t_exp * noise1
+            shared_noise = F.normalize(shared_noise, p=2, dim=1)
+        else:
+            # 计算 data 的平均 norm，将 noise 缩放到相同尺度
+            data_norm = (torch.norm(x1, dim=-1, keepdim=True) + torch.norm(x2, dim=-1, keepdim=True)) / 2
+            noise_norm = torch.norm(shared_noise, dim=-1, keepdim=True)
+            shared_noise = shared_noise * (data_norm / (noise_norm + 1e-8))
+
+        # 方向 1：x1 -> noise（使用 cond1，即源时间条件）
+        # 插值：x_t = (1-t) * x1 + t * noise
+        # t=0 时 x_t = x1 (data)
+        # t=1 时 x_t = noise
+        x_t1 = (1 - t_exp) * x1 + t_exp * shared_noise
         if self.normalize:
             x_t1 = x_t1 + 1e-8 * torch.randn_like(x_t1)
             x_t1 = F.normalize(x_t1, p=2, dim=1)
         v_pred1 = self.backbone(x_t1, t, cond1)
-        v_target1 = noise1 - x1
+        v_target1 = shared_noise - x1  # 速度场指向 noise
 
-        # 方向 2：x2 -> noise
-        noise2 = torch.randn_like(x2)
-        if self.normalize:
-            noise2 = F.normalize(noise2, p=2, dim=1)
-        x_t2 = (1 - t_exp) * x2 + t_exp * noise2
+        # 方向 2：x2 -> noise（使用 cond2，即目标时间条件）
+        # 插值：x_t = (1-t) * x2 + t * noise（共享同一个 noise）
+        x_t2 = (1 - t_exp) * x2 + t_exp * shared_noise
         if self.normalize:
             x_t2 = x_t2 + 1e-8 * torch.randn_like(x_t2)
             x_t2 = F.normalize(x_t2, p=2, dim=1)
         v_pred2 = self.backbone(x_t2, t, cond2)
-        v_target2 = noise2 - x2
+        v_target2 = shared_noise - x2  # 速度场指向 noise
 
         # 合并计算损失
         v_pred = torch.cat([v_pred1, v_pred2], dim=0)
@@ -282,9 +297,9 @@ class RFInversionOnly(nn.Module):
         # 一致性损失
         consistency_loss = torch.tensor(0.0, device=device)
         if use_consistency:
-            # 对两个方向分别计算一致性损失
-            consistency_loss1 = self._compute_consistency_loss(x1, noise1, cond1)
-            consistency_loss2 = self._compute_consistency_loss(x2, noise2, cond2)
+            # 对两个方向分别计算一致性损失（使用共享 noise）
+            consistency_loss1 = self._compute_consistency_loss(x1, shared_noise, cond1)
+            consistency_loss2 = self._compute_consistency_loss(x2, shared_noise, cond2)
             consistency_loss = (consistency_loss1 + consistency_loss2) / 2
 
         # 总损失
@@ -355,10 +370,17 @@ class RFInversionOnly(nn.Module):
         normalize: bool = False,
     ) -> List[torch.Tensor]:
         """
-        从 x1 反演到噪声，再从噪声生成 x2
+        从 x1 反演到噪声，再从噪声生成 x2（与 rtf.py 一致）
+
+        训练时学习的是 data -> noise 方向：
+        - t=0 时 x_t = data
+        - t=1 时 x_t = noise
+        - v = noise - data（速度指向 noise）
+
+        采样流程：x_cur (data, t=0) -> noise (t=1) -> x_target (data, t=0)
 
         Args:
-            x_start: 起点 x1 [B, n_genes]
+            x_start: 起点 x1 [B, n_genes]（对应 data，即 t=0）
             sample_steps: 采样步数（每个阶段）
             cond_start: x1 的条件信息（源时间）
             cond_target: x2 的条件信息（目标时间）
@@ -376,9 +398,11 @@ class RFInversionOnly(nn.Module):
 
         trajectory = [x.cpu()]
 
-        # 阶段 1：x1 -> noise（正向）
+        # 阶段 1：x_cur -> noise（正向积分，t: 0 -> 1）
+        # x_cur 是 data，对应 t=0；noise 对应 t=1
+        # 因为 v 指向 noise（从 data 到 noise），正向走：x = x + v * dt
         for step in range(sample_steps):
-            t_current = step / sample_steps
+            t_current = step / sample_steps  # 0, 1/N, 2/N, ..., (N-1)/N
             t = torch.full((batch_size,), t_current, device=device)
 
             v = self.backbone(x, t, cond_start)
@@ -387,7 +411,7 @@ class RFInversionOnly(nn.Module):
                 v_uncond = self.backbone(x, t, null_cond)
                 v = v_uncond + cfg_scale * (v - v_uncond)
 
-            x = x + v * dt
+            x = x + v * dt  # 正向积分：顺着速度场方向走
 
             if normalize:
                 x = x + 1e-8 * torch.randn_like(x)
@@ -395,9 +419,13 @@ class RFInversionOnly(nn.Module):
 
             trajectory.append(x.cpu())
 
-        # 阶段 2：noise -> x2（反向）
+        # 此时 x 应该接近 noise (t=1)
+
+        # 阶段 2：noise -> x_target（反向积分，t: 1 -> 0）
+        # 从 noise (t=1) 积分到 x_target (data, t=0)
+        # v 指向 noise，反向走：x = x - v * dt
         for step in range(sample_steps):
-            t_current = 1.0 - step / sample_steps
+            t_current = 1.0 - step / sample_steps  # 1, (N-1)/N, ..., 1/N
             t = torch.full((batch_size,), t_current, device=device)
 
             v = self.backbone(x, t, cond_target)
@@ -406,13 +434,15 @@ class RFInversionOnly(nn.Module):
                 v_uncond = self.backbone(x, t, null_cond)
                 v = v_uncond + cfg_scale * (v - v_uncond)
 
-            x = x - v * dt
+            x = x - v * dt  # 反向积分：逆着速度场方向走
 
             if normalize:
                 x = x + 1e-8 * torch.randn_like(x)
                 x = F.normalize(x, p=2, dim=1)
 
             trajectory.append(x.cpu())
+
+        # 此时 x 应该接近 x_target (data, t=0)
 
         return trajectory
 
@@ -659,6 +689,8 @@ class RTFOnlySystem(pl.LightningModule):
                 cfg_scale=self.cfg.training.cfg_scale,
                 normalize=self.cfg.model.normalize
             )
+            x_final = trajectory[-1].to(self.device)
+
         else:  # inversion
             cond_start = torch.stack([t_cur], dim=-1) if self.cfg.model.use_cond else None
             cond_target = torch.stack([t_next], dim=-1) if self.cfg.model.use_cond else None
@@ -674,11 +706,48 @@ class RTFOnlySystem(pl.LightningModule):
                 normalize=self.cfg.model.normalize
             )
 
-        x_final = trajectory[-1].to(self.device)
+            x_final = trajectory[-1].to(self.device)
+
+            # 诊断信息：检查中间 noise 状态
+            sample_steps = self.cfg.training.sample_steps
+            x_noise = trajectory[sample_steps].to(self.device)  # 阶段1结束后的 noise
+
+            # 计算 noise 的统计信息
+            noise_norm = torch.norm(x_noise, dim=-1).mean().item()
+            noise_mean = x_noise.mean().item()
+            noise_std = x_noise.std().item()
+
+            # 检查原始数据的 norm
+            x_cur_norm = torch.norm(x_cur, dim=-1).mean().item()
+            x_next_norm = torch.norm(x_next, dim=-1).mean().item()
+
+            print(f"  [诊断] 原始数据 norm: x_cur={x_cur_norm:.2f}, x_next={x_next_norm:.2f}")
+            print(f"  [诊断] 阶段1结束后 (noise):")
+            print(f"    norm: {noise_norm:.2f} (期望与data相近: {x_cur_norm:.2f})")
+            print(f"    mean: {noise_mean:.4f}, std: {noise_std:.4f}")
+
+            from models.utils import compute_correlation
+            # Oracle 测试：直接从缩放后的随机 noise 生成，跳过反演步骤
+            # 这可以告诉我们问题是出在阶段1还是阶段2
+            random_noise = torch.randn_like(x_cur)
+            # 缩放 noise 到与 data 相同的尺度
+            data_norm_avg = (torch.norm(x_cur, dim=-1, keepdim=True) + torch.norm(x_next, dim=-1, keepdim=True)) / 2
+            noise_norm_raw = torch.norm(random_noise, dim=-1, keepdim=True)
+            random_noise = random_noise * (data_norm_avg / (noise_norm_raw + 1e-8))
+
+            x_oracle = random_noise.clone()
+            dt = 1.0 / sample_steps
+            for step in range(sample_steps):
+                t_current = 1.0 - step / sample_steps
+                t = torch.full((x_oracle.shape[0],), t_current, device=self.device)
+                v = self.model.backbone(x_oracle, t, cond_target)
+                x_oracle = x_oracle - v * dt
+            oracle_corr = compute_correlation(x_next, x_oracle)
+            print(f"  [诊断] Oracle (从缩放noise生成): correlation={oracle_corr:.4f}")
 
         # 计算误差
-        recon_error = F.mse_loss(x_final, x_next).item()
         from models.utils import compute_correlation
+        recon_error = F.mse_loss(x_final, x_next).item()
         correlation = compute_correlation(x_next, x_final)
 
         self.log("sample_recon_error", recon_error, on_epoch=True)
